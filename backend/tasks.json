@@ -1,0 +1,38 @@
+{
+  "8d718265": {
+    "id": "8d718265",
+    "url": "https://www.amazon.com/gp/bestsellers/home-garden/3744541/",
+    "browse_node_id": "3744541",
+    "model": null,
+    "session_id": "6eea7d82-37ff-45e1-a89d-4aa7082db1c3",
+    "status": "completed",
+    "created_at": "2026-04-27T02:28:37.550806",
+    "updated_at": "2026-04-27T03:06:08.826906",
+    "workspace_path": "D:\\Niuhui7\\amazon-bestsellers-app\\workspace\\3744541",
+    "error": null
+  },
+  "7d4957c0": {
+    "id": "7d4957c0",
+    "url": "https://www.amazon.com/gp/bestsellers/beauty/11058221/",
+    "browse_node_id": "11058221",
+    "model": null,
+    "session_id": "3c9cca06-4bf0-4824-8280-551b5518d490",
+    "status": "completed",
+    "created_at": "2026-04-27T02:36:41.505377",
+    "updated_at": "2026-04-27T08:33:07.842187",
+    "workspace_path": "D:\\Niuhui7\\amazon-bestsellers-app\\workspace\\11058221",
+    "error": null
+  },
+  "9945cb90": {
+    "id": "9945cb90",
+    "url": "https://www.amazon.com/gp/bestsellers/fashion/1040658/",
+    "browse_node_id": "1040658",
+    "model": null,
+    "session_id": "ff1c6f9d-96b5-438f-913d-9dd21412375e",
+    "status": "running",
+    "created_at": "2026-04-28T01:23:59.706011",
+    "updated_at": "2026-04-28T01:23:59.772852",
+    "workspace_path": "D:\\Niuhui7\\amazon-bestsellers-app\\workspace\\1040658",
+    "error": null
+  }
+}
