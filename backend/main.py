@@ -44,6 +44,7 @@ APP_DIR = BACKEND_DIR.parent
 AGENT_DIR = APP_DIR / "agent"
 PLUGIN_DIR = str(AGENT_DIR)
 AGENT_ID = "amazon-bestsellers-summary:amazon-bestsellers-orchestrator"
+REFRESH_AGENT_ID = "amazon-bestsellers-summary:amazon-bestsellers-refresh-director"
 
 # Workspace is ALWAYS at <APP_DIR>/workspace/ — fully deterministic regardless of
 # the process launch directory. The claude subprocess is started with cwd=APP_DIR
@@ -134,7 +135,7 @@ def _load_stream_history(task_id: str) -> tuple[list[dict], list[str]]:
     try:
         rows = _db.execute(
             """SELECT item_id, kind, role, content, meta_json, final, version
-               FROM stream_items WHERE task_id = ? ORDER BY version""",
+               FROM stream_items WHERE task_id = ? ORDER BY created_at, version""",
             (task_id,),
         ).fetchall()
         items = []
@@ -179,6 +180,7 @@ class Task(BaseModel):
     id: str
     url: str
     browse_node_id: str
+    agent_id: Optional[str] = None
     model: Optional[str] = None
     session_id: Optional[str] = None
     status: TaskStatus = TaskStatus.PENDING
@@ -880,6 +882,24 @@ def _build_progress_from_workspace(workspace_path: str) -> dict:
     return phases
 
 
+def _snapshot_reports(workspace_path: str) -> None:
+    """Copy current report files to a timestamped snapshot directory."""
+    ws = Path(workspace_path)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    snap_dir = ws / "snapshots" / ts
+
+    summary = ws / "summary.md"
+    if summary.exists():
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(summary, snap_dir / "summary.md")
+
+    reports_dir = ws / "reports"
+    if reports_dir.exists():
+        for md_file in reports_dir.glob("*_dim.md"):
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(md_file, snap_dir / md_file.name)
+
+
 def _get_report_files(workspace_path: str) -> dict[str, Optional[str]]:
     """Return content of all report files if they exist."""
     ws = Path(workspace_path)
@@ -928,7 +948,7 @@ def _build_analysis_prompt(task: Task, mode: str = "full") -> str:
     ])
 
 
-async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str] = None):
+async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str] = None, agent_id: Optional[str] = None, reset_stream: bool = True):
     """Launch `claude` CLI as async subprocess and stream its output to log buffer.
 
     If ``--resume <session_id>`` fails because the session no longer exists
@@ -944,7 +964,10 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
     """
     prompt = prompt_override or _build_analysis_prompt(task)
 
-    _reset_task_stream(task_id)
+    if reset_stream:
+        _reset_task_stream(task_id)
+    else:
+        _log_and_stream(task_id, "[SYSTEM] ────────────────────────────────")
     _log_and_stream(task_id, f"[SYSTEM] 启动分析任务: {task.url}")
     _log_and_stream(task_id, f"[SYSTEM] Workspace: {task.workspace_path}")
 
@@ -960,7 +983,7 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
             cmd.extend([
                 "-p", prompt,
                 "--plugin-dir", PLUGIN_DIR,
-                "--agent", AGENT_ID,
+                "--agent", agent_id or AGENT_ID,
                 "--dangerously-skip-permissions",
                 "--output-format", "stream-json",
                 "--verbose",
@@ -1013,6 +1036,7 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
 
             if proc.returncode == 0 and fully_done:
                 _update_task(task_id, status=TaskStatus.COMPLETED)
+                _snapshot_reports(ws_path)
                 _log_and_stream(task_id, "[SYSTEM] ✅ 分析完成！")
             elif proc.returncode == 0:
                 missing = [p for p in ("crawl", "chunk", "analyze", "summary") if not phases[p]]
@@ -1168,6 +1192,7 @@ async def create_task(req: CreateTaskRequest, background_tasks=None):
         id=task_id,
         url=req.url,
         browse_node_id=browse_node_id,
+        agent_id=AGENT_ID,
         model=req.model,
         session_id=saved_session_id.strip() if saved_session_id and saved_session_id.strip() else None,
         status=TaskStatus.PENDING,
@@ -1175,6 +1200,18 @@ async def create_task(req: CreateTaskRequest, background_tasks=None):
         updated_at=now,
         workspace_path=workspace_path,
     )
+
+    # If workspace already has a complete prior analysis (summary.md exists),
+    # reuse it instead of re-running the agent. The new task takes ownership
+    # of the existing artifacts and lands in COMPLETED state immediately.
+    phases = _build_progress_from_workspace(workspace_path)
+    if phases.get("summary"):
+        task.status = TaskStatus.COMPLETED
+        tasks = _load_tasks()
+        tasks[task_id] = task
+        _save_tasks(tasks)
+        _sync_task_analysis_meta(task)
+        return task
 
     tasks = _load_tasks()
     tasks[task_id] = task
@@ -1211,8 +1248,9 @@ async def resume_task(task_id: str):
     _sync_task_analysis_meta(task)
     _mark_browse_node_active(task.browse_node_id, task_id)
 
+    agent_id = task.agent_id or AGENT_ID
     _log_and_stream(task_id, "[SYSTEM] ♻️ 收到继续分析请求，将复用现有 workspace 进行断点续跑。")
-    asyncio.create_task(_run_analysis(task_id, task))
+    asyncio.create_task(_run_analysis(task_id, task, agent_id=agent_id, reset_stream=False))
     return task
 
 
@@ -1243,10 +1281,10 @@ async def refresh_task(task_id: str):
             detail="该类目尚未完成过分析，无法增量更新。请先创建新的分析任务。",
         )
 
-    meta = _load_analysis_meta(task.workspace_path)
-    saved_session_id = meta.get("session_id") if isinstance(meta.get("session_id"), str) else None
-    if saved_session_id and saved_session_id.strip():
-        task.session_id = saved_session_id.strip()
+    # Clear session_id — refresh switches to a different agent (refresh-director),
+    # so the old orchestrator session cannot be resumed.
+    task.session_id = None
+    task.agent_id = REFRESH_AGENT_ID
     task.status = TaskStatus.PENDING
     task.error = None
     task.updated_at = datetime.utcnow().isoformat()
@@ -1257,7 +1295,7 @@ async def refresh_task(task_id: str):
 
     refresh_prompt = _build_analysis_prompt(task, mode="refresh")
     _log_and_stream(task_id, "[SYSTEM] 🔄 收到增量更新请求，将重新爬取列表页获取最新排名，仅处理新增/变化 ASIN。")
-    asyncio.create_task(_run_analysis(task_id, task, prompt_override=refresh_prompt))
+    asyncio.create_task(_run_analysis(task_id, task, prompt_override=refresh_prompt, agent_id=REFRESH_AGENT_ID, reset_stream=False))
     return task
 
 
@@ -1283,8 +1321,8 @@ async def reanalyze_task(task_id: str):
     # Wipe workspace contents (but keep the directory itself)
     if ws.exists():
         for child in ws.iterdir():
-            if child.name == ANALYSIS_META_FILE:
-                continue  # handled separately below
+            if child.name in (ANALYSIS_META_FILE, "snapshots"):
+                continue  # handled separately below / preserved across reanalyze
             if child.is_dir():
                 shutil.rmtree(child, ignore_errors=True)
             else:
@@ -1298,6 +1336,7 @@ async def reanalyze_task(task_id: str):
     _save_analysis_meta(task.workspace_path, {"session_id": ""})
     _delete_task_history(task_id)
 
+    task.agent_id = AGENT_ID
     task.status = TaskStatus.PENDING
     task.error = None
     task.updated_at = datetime.utcnow().isoformat()
@@ -1308,6 +1347,33 @@ async def reanalyze_task(task_id: str):
 
     _log_and_stream(task_id, "[SYSTEM] 🔥 收到全量重新分析请求，已清除所有历史数据，将从头开始全新分析。")
     asyncio.create_task(_run_analysis(task_id, task))
+    return task
+
+
+@app.post("/api/tasks/{task_id}/stop", response_model=Task)
+async def stop_task(task_id: str):
+    """Interrupt a running or pending task immediately."""
+    tasks = _load_tasks()
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = tasks[task_id]
+    if task.status not in (TaskStatus.RUNNING, TaskStatus.PENDING):
+        raise HTTPException(status_code=409, detail="Task is not running")
+
+    proc = _running_processes.pop(task_id, None)
+    if proc:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    _clear_browse_node_active(task.browse_node_id, task_id)
+
+    task.status = TaskStatus.FAILED
+    task.error = "已被用户中断。"
+    task.updated_at = datetime.utcnow().isoformat()
+    tasks[task_id] = task
+    _save_tasks(tasks)
+    _log_and_stream(task_id, "[SYSTEM] 🛑 用户主动中断任务。")
     return task
 
 
@@ -1420,7 +1486,7 @@ async def chat_with_task(task_id: str, req: ChatRequest):
         cmd.extend([
             "-p", context,
             "--plugin-dir", PLUGIN_DIR,
-            "--agent", AGENT_ID,
+            "--agent", task.agent_id or AGENT_ID,
             "--dangerously-skip-permissions",
             "--output-format", "stream-json",
             "--verbose",

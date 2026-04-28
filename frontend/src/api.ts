@@ -4,6 +4,7 @@ export interface Task {
   id: string
   url: string
   browse_node_id: string
+  agent_id: string | null
   model: string | null
   status: TaskStatus
   created_at: string
@@ -150,6 +151,15 @@ export const api = {
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
       throw new Error(err.detail || 'Failed to reanalyze task')
+    }
+    return res.json()
+  },
+
+  async stopTask(id: string): Promise<Task> {
+    const res = await fetch(`${BASE}/tasks/${id}/stop`, { method: 'POST' })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.detail || 'Failed to stop task')
     }
     return res.json()
   },

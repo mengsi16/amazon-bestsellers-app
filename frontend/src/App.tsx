@@ -54,6 +54,7 @@ export default function App() {
   const [resuming, setResuming] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [reanalyzing, setReanalyzing] = useState(false)
+  const [stopping, setStopping] = useState(false)
   const [showReanalyzeConfirm, setShowReanalyzeConfirm] = useState(false)
   const [showReports, setShowReports] = useState(false)
 
@@ -235,6 +236,29 @@ export default function App() {
     await loadTasks()
   }
 
+  // ── Reopen SSE without resetting stream state (resume / refresh) ──────────
+  const reopenSSE = useCallback((id: string) => {
+    sseRef.current?.close()
+    // Refresh phases immediately so the stage rail reflects the new run
+    api.getReports(id).then((r) => {
+      setReports({ path: r.workspace_path, data: r.reports })
+      setPhases(r.phases)
+    }).catch(() => {})
+    const es = openProgressSSE(
+      id,
+      (e) => applySSEEvent(e.event, e.data),
+      async () => {
+        await loadTasks()
+        try {
+          const r = await api.getReports(id)
+          setReports({ path: r.workspace_path, data: r.reports })
+          setPhases(r.phases)
+        } catch {}
+      }
+    )
+    sseRef.current = es
+  }, [applySSEEvent, loadTasks])
+
   // ── Resume task ──────────────────────────────────────────────────────────
   const handleResume = async () => {
     if (!activeId) return
@@ -242,7 +266,7 @@ export default function App() {
     try {
       await api.resumeTask(activeId)
       await loadTasks()
-      await selectTask(activeId)
+      reopenSSE(activeId)
     } catch (err) {
       alert(`继续分析失败：${err}`)
     } finally {
@@ -257,11 +281,26 @@ export default function App() {
     try {
       await api.refreshTask(activeId)
       await loadTasks()
-      await selectTask(activeId)
+      reopenSSE(activeId)
     } catch (err) {
       alert(`刷新排名失败：${err}`)
     } finally {
       setRefreshing(false)
+    }
+  }
+
+  // ── Stop task (interrupt) ─────────────────────────────────────────────────
+  const handleStop = async () => {
+    if (!activeId) return
+    setStopping(true)
+    try {
+      const updated = await api.stopTask(activeId)
+      setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)))
+      sseRef.current?.close()
+    } catch (err) {
+      alert(`中断失败：${err}`)
+    } finally {
+      setStopping(false)
     }
   }
 
@@ -317,7 +356,7 @@ export default function App() {
     )
   }
 
-  const canAsk = phases.qa && activeTask?.status !== 'pending'
+  const canAsk = activeTask != null && activeTask.status !== 'running' && activeTask.status !== 'pending'
   const hasAnyReport = reports && Object.values(reports.data).some(Boolean)
 
   return (
@@ -414,6 +453,8 @@ export default function App() {
                 items={itemsArray}
                 localMessages={localMessages}
                 onSend={handleSendChat}
+                onStop={handleStop}
+                stopping={stopping}
                 canAsk={Boolean(canAsk)}
                 isTaskRunning={activeTask.status === 'running' || activeTask.status === 'pending'}
                 task={activeTask}

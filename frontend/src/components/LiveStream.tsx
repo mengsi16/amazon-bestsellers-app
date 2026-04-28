@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
-  Bot, User, Send, Loader2, ChevronDown, ChevronRight,
+  Bot, User, Send, Square, Loader2, ChevronDown, ChevronRight,
   Wrench, Cpu, CheckCircle2, XCircle, AlertTriangle, Info, Sparkles,
 } from 'lucide-react'
 import type { StreamItem, Task } from '../api'
@@ -19,6 +19,8 @@ interface Props {
   items: StreamItem[]
   localMessages: LocalMessage[]
   onSend: (text: string) => void
+  onStop: () => void
+  stopping: boolean
   canAsk: boolean
   isTaskRunning: boolean
   task: Task | null
@@ -258,6 +260,8 @@ export default function LiveStream({
   items,
   localMessages,
   onSend,
+  onStop,
+  stopping,
   canAsk,
   isTaskRunning,
   task,
@@ -313,12 +317,10 @@ export default function LiveStream({
 
   const placeholder = useMemo(() => {
     if (!canAsk) {
-      return isTaskRunning
-        ? '分析进行中，summary.md 写出后可在此追问…'
-        : '分析完成后可在此追问…'
+      return '分析进行中，完成后可在此追问…'
     }
-    return '就报告内容追问（Enter 发送，Shift+Enter 换行）'
-  }, [canAsk, isTaskRunning])
+    return '就分析内容追问（Enter 发送，Shift+Enter 换行）'
+  }, [canAsk])
 
   return (
     <div className="flex flex-col h-full bg-[#0f1117]">
@@ -429,18 +431,27 @@ export default function LiveStream({
             <span className="text-xs text-slate-600">
               {canAsk
                 ? 'Enter 发送 · Shift+Enter 换行'
-                : isTaskRunning
-                ? '等待 summary.md 生成…'
-                : '任务未完成'}
+                : '分析进行中…'}
             </span>
-            <button
-              onClick={handleSend}
-              disabled={!input.trim() || !canAsk}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
-            >
-              <Send size={12} />
-              发送
-            </button>
+            {isTaskRunning ? (
+              <button
+                onClick={onStop}
+                disabled={stopping}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-red-600 hover:bg-red-500 text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+              >
+                <Square size={12} className={stopping ? 'animate-pulse' : ''} fill="currentColor" />
+                中断
+              </button>
+            ) : (
+              <button
+                onClick={handleSend}
+                disabled={!input.trim() || !canAsk}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+              >
+                <Send size={12} />
+                发送
+              </button>
+            )}
           </div>
         </div>
       </div>
