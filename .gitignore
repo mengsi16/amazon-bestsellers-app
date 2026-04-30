@@ -1,6 +1,85 @@
+# 1. Python & FastAPI
 __pycache__/
-.vscode/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 .venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# 2. Environment Variables & Secrets (CRITICAL)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+.secret
+credentials/
+config/*.json
+!config/default.json
+
+# 3. Databases & Data (SQLite, backups, etc.)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+postgres_data/
+
+# 4. Logs
+logs/
+*.log
+
+# 5. Frontend (Vite / Node) & Build
 node_modules/
-workspace/
+.npm/
+dist/
+build/
+out/
+.vercel
+.next
+
+# 6. Testing coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# 7. IDE / OS / Tooling
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
 .claude/
+
+# 8. Project-specific
+workspace/
+output/

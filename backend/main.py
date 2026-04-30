@@ -42,7 +42,7 @@ from sse_starlette.sse import EventSourceResponse
 BACKEND_DIR = Path(__file__).parent
 APP_DIR = BACKEND_DIR.parent
 AGENT_DIR = APP_DIR / "agent"
-PLUGIN_DIR = str(AGENT_DIR)
+PLUGIN_DIR = AGENT_DIR.as_posix()
 AGENT_ID = "amazon-bestsellers-summary:amazon-bestsellers-orchestrator"
 REFRESH_AGENT_ID = "amazon-bestsellers-summary:amazon-bestsellers-refresh-director"
 
@@ -948,6 +948,69 @@ def _build_analysis_prompt(task: Task, mode: str = "full") -> str:
     ])
 
 
+def _escape_quotes(text: str) -> str:
+    """Escape double quotes with backslash for injection into claude -p prompts."""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _build_chat_context(task: Task, user_message: str) -> str:
+    """Assemble full context for a follow-up chat question.
+
+    Backend-managed context includes:
+      - Task metadata (URL, browse_node_id, workspace path)
+      - All report file contents (summary + 4 dimension reports)
+      - Previous chat history from SQLite
+      - The user's new question
+
+    All double quotes are backslash-escaped so the assembled prompt can be
+    safely passed to `claude -p "..."`.
+    """
+    parts: list[str] = []
+
+    # ── Task metadata ──────────────────────────────────────────────────
+    parts.append("=== 任务元数据 ===")
+    parts.append(f"类目 URL: {task.url}")
+    parts.append(f"Browse Node ID: {task.browse_node_id}")
+    parts.append(f"Workspace 路径: {task.workspace_path}")
+    parts.append("")
+
+    # ── Report contents ────────────────────────────────────────────────
+    reports = _get_report_files(task.workspace_path)
+    has_any_report = any(v for v in reports.values())
+    if has_any_report:
+        parts.append("=== 分析报告 ===")
+        dim_labels = {
+            "summary": "综合汇总",
+            "marketplace": "Marketplace 维度",
+            "reviews": "Reviews 维度",
+            "aplus": "A+ Content 维度",
+            "fine_grained": "Fine-Grained 维度",
+        }
+        for key, label in dim_labels.items():
+            content = reports.get(key)
+            if content:
+                parts.append(f"--- {label} ---")
+                parts.append(content)
+                parts.append("")
+        parts.append("")
+
+    # ── Chat history ───────────────────────────────────────────────────
+    history = _load_chat_history(task.id)
+    if history:
+        parts.append("=== 历史追问记录 ===")
+        for msg in history:
+            role_label = "用户" if msg["role"] == "user" else "助手"
+            parts.append(f"[{role_label}]: {msg['content']}")
+        parts.append("")
+
+    # ── User's new question ────────────────────────────────────────────
+    parts.append("=== 当前问题 ===")
+    parts.append(user_message)
+
+    raw = "\n".join(parts)
+    return _escape_quotes(raw)
+
+
 async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str] = None, agent_id: Optional[str] = None, reset_stream: bool = True):
     """Launch `claude` CLI as async subprocess and stream its output to log buffer.
 
@@ -981,10 +1044,10 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
             if task.session_id:
                 cmd.extend(["--resume", task.session_id])
             cmd.extend([
-                "-p", prompt,
+                "--dangerously-skip-permissions",
                 "--plugin-dir", PLUGIN_DIR,
                 "--agent", agent_id or AGENT_ID,
-                "--dangerously-skip-permissions",
+                "-p", prompt,
                 "--output-format", "stream-json",
                 "--verbose",
                 "--include-partial-messages",
@@ -1000,6 +1063,8 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
             def _on_line(line: str) -> None:
                 _append_log(task_id, line)
                 _feed_stream_line(task_id, line)
+
+            _log_and_stream(task_id, f"[SYSTEM] CMD: {' '.join(cmd)}")
 
             proc: Optional[subprocess.Popen] = None
             _update_task(task_id, status=TaskStatus.RUNNING)
@@ -1185,16 +1250,15 @@ async def create_task(req: CreateTaskRequest, background_tasks=None):
     # when the claude subprocess runs with `cwd=APP_DIR`, so backend + agent
     # never disagree on where data lives.
     workspace_path = str(_resolve_workspace_path(browse_node_id))
-    meta = _load_analysis_meta(workspace_path)
-    saved_session_id = meta.get("session_id") if isinstance(meta.get("session_id"), str) else None
 
+    # Full analysis always starts a fresh claude terminal — no session reuse.
     task = Task(
         id=task_id,
         url=req.url,
         browse_node_id=browse_node_id,
         agent_id=AGENT_ID,
         model=req.model,
-        session_id=saved_session_id.strip() if saved_session_id and saved_session_id.strip() else None,
+        session_id=None,
         status=TaskStatus.PENDING,
         created_at=now,
         updated_at=now,
@@ -1463,7 +1527,12 @@ async def download_report(task_id: str, dim: str):
 @app.post("/api/tasks/{task_id}/chat")
 async def chat_with_task(task_id: str, req: ChatRequest):
     """
-    Proxy a follow-up question through claude CLI with conversation continuation.
+    Follow-up question: launch a fresh `claude` CLI process (no agent, no
+    session resume).  All context — task metadata, report contents, and
+    previous chat history — is assembled by the backend and injected into
+    the prompt so Claude has full visibility without relying on a prior
+    session.
+
     Streams the response back as SSE.
     """
     tasks = _load_tasks()
@@ -1472,27 +1541,19 @@ async def chat_with_task(task_id: str, req: ChatRequest):
     task = tasks[task_id]
     _assert_browse_node_not_running(task.browse_node_id)
 
-    # Inject workspace context into the prompt so Claude knows what we're discussing
-    context = (
-        f"[上下文：当前分析的 Amazon Bestsellers 类目 URL 为 {task.url}，"
-        f"分析报告存储在 {task.workspace_path}]\n\n"
-        f"{req.message}"
-    )
+    # Backend-assembled context with all reports + chat history
+    context = _build_chat_context(task, req.message)
 
-    def _build_chat_cmd(session_id: Optional[str]) -> list[str]:
-        cmd = ["claude"]
-        if session_id:
-            cmd.extend(["--resume", session_id])
-        cmd.extend([
-            "-p", context,
-            "--plugin-dir", PLUGIN_DIR,
-            "--agent", task.agent_id or AGENT_ID,
-            "--dangerously-skip-permissions",
-            "--output-format", "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-        ])
-        return cmd
+    cmd = [
+        "claude",
+        "--dangerously-skip-permissions",
+        "-p", context,
+        "--output-format", "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+    ]
+    if task.model:
+        cmd.extend(["--model", task.model])
 
     def _extract_text_chunks(raw_line: str) -> list[str]:
         """Pull user-visible assistant text out of a single stream-json line."""
@@ -1517,55 +1578,32 @@ async def chat_with_task(task_id: str, req: ChatRequest):
         return []
 
     async def _stream() -> AsyncGenerator[str, None]:
-        _chat_retried = False
         # Persist user message
         _save_chat_message(task_id, "user", req.message)
         _assistant_text_buf: list[str] = []
-        while True:
-            cmd = _build_chat_cmd(task.session_id)
-            try:
-                proc = _spawn_process(cmd)
-                _session_not_found = False
-                if proc.stdout is not None:
-                    while True:
-                        raw = await asyncio.to_thread(proc.stdout.readline)
-                        if raw == "":
-                            if proc.poll() is not None:
-                                break
-                            await asyncio.sleep(0.05)
-                            continue
-                        # Detect stale session early, before streaming any content
-                        if "No conversation found with session ID" in raw and task.session_id and not _chat_retried:
-                            _session_not_found = True
+        try:
+            proc = _spawn_process(cmd)
+            if proc.stdout is not None:
+                while True:
+                    raw = await asyncio.to_thread(proc.stdout.readline)
+                    if raw == "":
+                        if proc.poll() is not None:
                             break
-                        session_id = _extract_stream_session_id(raw)
-                        if session_id:
-                            _persist_task_session_id(task_id, session_id)
-                        for chunk in _extract_text_chunks(raw):
-                            if chunk:
-                                _assistant_text_buf.append(chunk)
-                                yield f"data: {json.dumps({'text': chunk})}\n\n"
-                # ── Stale session fallback ──
-                if _session_not_found and task.session_id and not _chat_retried:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    task.session_id = None
-                    _update_task(task_id, session_id=None)
-                    _save_analysis_meta(task.workspace_path, {"session_id": ""})
-                    _chat_retried = True
-                    continue  # retry without --resume
-                await _wait_process(proc)
-                # Persist assistant response
-                if _assistant_text_buf:
-                    _save_chat_message(task_id, "assistant", "".join(_assistant_text_buf))
-                yield f"data: {json.dumps({'done': True})}\n\n"
-            except FileNotFoundError:
-                yield f"data: {json.dumps({'error': 'claude CLI not found'})}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            break  # done (retry uses continue)
+                        await asyncio.sleep(0.05)
+                        continue
+                    for chunk in _extract_text_chunks(raw):
+                        if chunk:
+                            _assistant_text_buf.append(chunk)
+                            yield f"data: {json.dumps({'text': chunk})}\n\n"
+            await _wait_process(proc)
+            # Persist assistant response
+            if _assistant_text_buf:
+                _save_chat_message(task_id, "assistant", "".join(_assistant_text_buf))
+            yield f"data: {json.dumps({'done': True})}\n\n"
+        except FileNotFoundError:
+            yield f"data: {json.dumps({'error': 'claude CLI not found'})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
 
