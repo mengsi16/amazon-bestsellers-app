@@ -15,10 +15,14 @@ Provides:
   DELETE /api/tasks/{task_id}        — Delete a task record
 """
 
+import atexit
+import logging
 import asyncio
 import json
 import os
 import re
+import secrets
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -30,11 +34,21 @@ from enum import Enum
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import aiofiles
-from fastapi import FastAPI, HTTPException
+import bcrypt
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from jose import JWTError, jwt
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sse_starlette.sse import EventSourceResponse
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -55,6 +69,18 @@ SUBPROCESS_CWD = APP_DIR
 # Simple JSON file-based task store
 TASKS_FILE = BACKEND_DIR / "tasks.json"
 ANALYSIS_META_FILE = ".analysis_meta.json"
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+LOGGER = logging.getLogger("amazon_bestsellers")
+if not LOGGER.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    LOGGER.addHandler(_handler)
+    LOGGER.setLevel(logging.INFO)
 
 # ── SQLite for persistent conversation history ─────────────────────────────────
 DB_PATH = BACKEND_DIR / "conversations.db"
@@ -95,11 +121,218 @@ def _init_db() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_chat_messages_task
         ON chat_messages(task_id, id)
     """)
+    # T4: sessions 表 — 持久化 Claude Code session 信息
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id   TEXT PRIMARY KEY,
+            task_id      TEXT NOT NULL,
+            created_at   TEXT NOT NULL DEFAULT '',
+            last_used_at TEXT NOT NULL DEFAULT '',
+            expires_at   TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_sessions_task
+        ON sessions(task_id)
+    """)
+    # tasks 表 — 持久化任务信息（替代 tasks.json）
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id            TEXT PRIMARY KEY,
+            url           TEXT NOT NULL,
+            browse_node_id TEXT NOT NULL,
+            model         TEXT,
+            session_id    TEXT,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            created_at    TEXT NOT NULL DEFAULT '',
+            updated_at    TEXT NOT NULL DEFAULT '',
+            workspace_path TEXT NOT NULL DEFAULT '',
+            error         TEXT,
+            owner_id      TEXT,
+            is_public     INTEGER NOT NULL DEFAULT 0,
+            data_json     TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_tasks_owner
+        ON tasks(owner_id)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_tasks_status
+        ON tasks(status)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_tasks_browse_node
+        ON tasks(browse_node_id)
+    """)
+    # T1: users 表 — 用户注册与登录
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id            TEXT PRIMARY KEY,
+            username      TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at    TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    # model_configs 表 — 用户模型配置
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_configs (
+            id              TEXT PRIMARY KEY,
+            user_id         TEXT NOT NULL,
+            name            TEXT NOT NULL,
+            model           TEXT NOT NULL DEFAULT 'claude-3-5-sonnet-20241022',
+            api_key_encrypted TEXT NOT NULL,
+            base_url        TEXT,
+            is_default      INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_model_configs_user ON model_configs(user_id)")
+    # credits_log 表 — API 使用量明细
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS credits_log (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id          TEXT NOT NULL,
+            user_id          TEXT NOT NULL,
+            cache_hit_input  INTEGER NOT NULL DEFAULT 0,
+            cache_miss_input INTEGER NOT NULL DEFAULT 0,
+            output_tokens    INTEGER NOT NULL DEFAULT 0,
+            cost_usd         REAL NOT NULL DEFAULT 0,
+            model            TEXT,
+            created_at       TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_credits_log_user ON credits_log(user_id)")
     conn.commit()
     return conn
 
 
 _db = _init_db()
+
+# ── Fernet 加密工具 ───────────────────────────────────────────────────────────
+
+def _get_fernet() -> Fernet:
+    """获取 Fernet 加密实例，密钥从环境变量读取。"""
+    key = os.environ.get("CREDITS_ENCRYPTION_KEY")
+    if not key:
+        if os.environ.get("ENV") == "production":
+            raise RuntimeError("CREDITS_ENCRYPTION_KEY 环境变量未设置")
+        # 开发环境使用临时密钥
+        key = Fernet.generate_key().decode() if hasattr(Fernet, 'generate_key') else "devkey1234567890"
+    if len(key) < 32:
+        key = key.zfill(32)[:32]
+    # Fernet 密钥需要是 32 字节且用 base64 编码
+    import base64
+    key_bytes = key.encode()[:32]
+    while len(key_bytes) < 32:
+        key_bytes += key_bytes
+    fernet_key = base64.urlsafe_b64encode(key_bytes[:32])
+    return Fernet(fernet_key)
+
+
+def _encrypt_api_key(api_key: str) -> str:
+    """加密 API key。"""
+    try:
+        f = _get_fernet()
+        return f.encrypt(api_key.encode()).decode()
+    except Exception:
+        LOGGER.warning("API key 加密失败，将存储明文")
+        return api_key
+
+
+def _decrypt_api_key(encrypted: str) -> str:
+    """解密 API key。"""
+    try:
+        f = _get_fernet()
+        return f.decrypt(encrypted.encode()).decode()
+    except Exception:
+        # 可能不是加密的，直接返回
+        return encrypted
+
+
+# ── JWT 认证 ──────────────────────────────────────────────────────────────────
+
+_jwt_env = os.environ.get("JWT_SECRET_KEY")
+if not _jwt_env:
+    if os.environ.get("ENV") == "production":
+        LOGGER.error("JWT_SECRET_KEY 环境变量未设置，生产环境必须配置。拒绝启动。")
+        raise SystemExit(1)
+    LOGGER.warning("JWT_SECRET_KEY 环境变量未设置，使用随机密钥（每次启动不同，仅适合开发环境）")
+    _jwt_env = secrets.token_urlsafe(32)
+JWT_SECRET_KEY_CURRENT = _jwt_env
+JWT_SECRET_KEY_PREVIOUS = os.environ.get("JWT_SECRET_KEY_PREVIOUS", "")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_DAYS = 30
+
+# 需要排除在认证之外的路径
+_AUTH_EXEMPT_PATHS = {
+    "/api/auth/register",
+    "/api/auth/login",
+    "/api/health",
+    "/docs",
+    "/openapi.json",
+    "/redoc",
+}
+
+
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+
+
+def _create_jwt(user_id: str, username: str) -> str:
+    from datetime import timedelta
+    expire = datetime.utcnow() + timedelta(days=JWT_EXPIRE_DAYS)
+    payload = {"sub": user_id, "username": username, "exp": expire}
+    return jwt.encode(payload, JWT_SECRET_KEY_CURRENT, algorithm=JWT_ALGORITHM)
+
+
+def _decode_jwt(token: str) -> Optional[dict]:
+    """尝试用 current key 解码，失败则用 previous key。"""
+    for key in [JWT_SECRET_KEY_CURRENT, JWT_SECRET_KEY_PREVIOUS]:
+        if not key:
+            continue
+        try:
+            return jwt.decode(token, key, algorithms=[JWT_ALGORITHM])
+        except JWTError:
+            continue
+    return None
+
+
+def _get_current_user_id(request: Request) -> Optional[str]:
+    """从 Authorization header 提取 user_id，未认证返回 None。"""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth[7:]
+    payload = _decode_jwt(token)
+    if payload is None:
+        return None
+    return payload.get("sub")
+
+
+def _require_user(request: Request) -> str:
+    """强制要求登录，返回 user_id；未登录抛 401。"""
+    user_id = _get_current_user_id(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="未登录，请先登录")
+    return user_id
+
+
+# ── Models (auth) ─────────────────────────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 
 def _save_chat_message(task_id: str, role: str, content: str) -> None:
@@ -111,7 +344,7 @@ def _save_chat_message(task_id: str, role: str, content: str) -> None:
         )
         _db.commit()
     except Exception:
-        pass
+        LOGGER.error("Failed to save chat message for task '%s'", task_id, exc_info=True)
 
 
 def _load_chat_history(task_id: str) -> list[dict]:
@@ -123,6 +356,7 @@ def _load_chat_history(task_id: str) -> list[dict]:
         ).fetchall()
         return [{"id": r[0], "role": r[1], "content": r[2], "created_at": r[3]} for r in rows]
     except Exception:
+        LOGGER.error("Failed to load chat history for task '%s'", task_id, exc_info=True)
         return []
 
 
@@ -153,6 +387,7 @@ def _load_stream_history(task_id: str) -> tuple[list[dict], list[str]]:
             order.append(r[0])
         return items, order
     except Exception:
+        LOGGER.error("Failed to load stream history for task '%s'", task_id, exc_info=True)
         return [], []
 
 
@@ -161,9 +396,10 @@ def _delete_task_history(task_id: str) -> None:
     try:
         _db.execute("DELETE FROM stream_items WHERE task_id = ?", (task_id,))
         _db.execute("DELETE FROM chat_messages WHERE task_id = ?", (task_id,))
+        _db.execute("DELETE FROM sessions WHERE task_id = ?", (task_id,))
         _db.commit()
     except Exception:
-        pass
+        LOGGER.error("Failed to delete task history for task '%s'", task_id, exc_info=True)
 
 # ── Models ─────────────────────────────────────────────────────────────────────
 
@@ -173,6 +409,7 @@ class TaskStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class Task(BaseModel):
@@ -186,6 +423,9 @@ class Task(BaseModel):
     updated_at: str
     workspace_path: str
     error: Optional[str] = None
+    # T2: 用户权限与任务归属
+    owner_id: Optional[str] = None
+    is_public: bool = False
 
 
 class CreateTaskRequest(BaseModel):
@@ -197,6 +437,24 @@ class ChatRequest(BaseModel):
     message: str
 
 
+# ── Model Configs API ──────────────────────────────────────────────────────────
+
+class ModelConfigCreate(BaseModel):
+    name: str
+    model: str = "claude-3-5-sonnet-20241022"
+    api_key: str  # 明文传入，内部加密存储
+    base_url: Optional[str] = None
+    is_default: bool = False
+
+
+class ModelConfigUpdate(BaseModel):
+    name: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    is_default: Optional[bool] = None
+
+
 # ── In-memory state ────────────────────────────────────────────────────────────
 
 # task_id -> subprocess.Popen
@@ -204,6 +462,9 @@ _running_processes: dict[str, subprocess.Popen] = {}
 
 # browse_node_id -> task_id for analyses that have been scheduled or are actively running
 _active_browse_node_tasks: dict[str, str] = {}
+
+# task_id -> True — prevents concurrent chat requests on the same task
+_active_chat_tasks: dict[str, bool] = {}
 
 # task_id -> list of log lines collected so far (ring buffer, max 2000)
 # These are the raw stdout lines (including stream-json JSON) kept for debug.
@@ -223,6 +484,28 @@ _task_stream_version: dict[str, int] = {}
 
 # task_id -> parser state dict (current message / text block / tool block)
 _task_parser_state: dict[str, dict] = {}
+
+
+# ── 优雅停机 ─────────────────────────────────────────────────────────────────
+
+def _cleanup_on_shutdown():
+    """进程退出时清理所有运行中的子进程。"""
+    LOGGER.info("正在清理 %d 个运行中的子进程...", len(_running_processes))
+    for task_id, proc in list(_running_processes.items()):
+        try:
+            proc.kill()
+            LOGGER.info("已终止子进程: task_id=%s, pid=%d", task_id, proc.pid)
+        except Exception:
+            LOGGER.warning("终止子进程失败: task_id=%s", task_id, exc_info=True)
+    _running_processes.clear()
+
+
+atexit.register(_cleanup_on_shutdown)
+
+# 注册信号处理（仅在非 Windows 平台）
+if sys.platform != "win32":
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda s, f: (_cleanup_on_shutdown(), sys.exit(0)))
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -283,6 +566,7 @@ def _load_analysis_meta(workspace_path: str | Path) -> dict:
     try:
         data = json.loads(meta_path.read_text(encoding="utf-8"))
     except Exception:
+        LOGGER.error("Failed to load analysis_meta from '%s'", meta_path, exc_info=True)
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -335,6 +619,47 @@ def _persist_task_session_id(task_id: str, session_id: str) -> None:
         tasks[task_id] = task
         _save_tasks(tasks)
     _sync_task_analysis_meta(task)
+    # T4: 同步写入 sessions 表
+    _upsert_session(session_id, task_id)
+
+
+def _upsert_session(session_id: str, task_id: str) -> None:
+    """T4: 写入或更新 sessions 表。"""
+    now = datetime.utcnow().isoformat()
+    try:
+        _db.execute(
+            """INSERT INTO sessions (session_id, task_id, created_at, last_used_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                   last_used_at = excluded.last_used_at
+            """,
+            (session_id, task_id, now, now),
+        )
+        _db.commit()
+    except Exception:
+        LOGGER.error("Failed to upsert session '%s'", session_id, exc_info=True)
+
+
+def _load_session_for_task(task_id: str) -> Optional[str]:
+    """T4: 从 sessions 表恢复 task 的 session_id。"""
+    try:
+        row = _db.execute(
+            "SELECT session_id FROM sessions WHERE task_id = ? ORDER BY last_used_at DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        LOGGER.error("Failed to load session for task '%s'", task_id, exc_info=True)
+        return None
+
+
+def _delete_sessions_for_task(task_id: str) -> None:
+    """删除 task 关联的 sessions 记录。"""
+    try:
+        _db.execute("DELETE FROM sessions WHERE task_id = ?", (task_id,))
+        _db.commit()
+    except Exception:
+        LOGGER.error("Failed to delete sessions for task '%s'", task_id, exc_info=True)
 
 
 def _find_running_task_for_browse_node(browse_node_id: str, exclude_task_id: Optional[str] = None) -> Optional[str]:
@@ -375,6 +700,12 @@ def _reconcile_task(task: Task) -> Task:
         task.session_id = meta_session_id.strip()
     elif task.session_id:
         _sync_task_analysis_meta(task)
+    # T4: 若文件系统和 task 都无 session_id，尝试从 SQLite sessions 表恢复
+    if not task.session_id:
+        db_session = _load_session_for_task(task.id)
+        if db_session:
+            task.session_id = db_session
+            _sync_task_analysis_meta(task)
     phases = _build_progress_from_workspace(task.workspace_path)
     done = [k for k, v in phases.items() if v]
     missing = [k for k, v in phases.items() if not v]
@@ -404,32 +735,86 @@ def _reconcile_task(task: Task) -> Task:
 
 
 def _load_tasks() -> dict[str, Task]:
-    if not TASKS_FILE.exists():
-        return {}
+    """从 SQLite 加载所有任务。首次运行时自动迁移 tasks.json 数据。"""
     try:
-        raw = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+        # 首次迁移：如果 tasks.json 存在且 tasks 表为空，导入旧数据
+        if TASKS_FILE.exists():
+            row = _db.execute("SELECT COUNT(*) FROM tasks").fetchone()
+            if row and row[0] == 0:
+                _migrate_tasks_from_json()
+
+        rows = _db.execute(
+            "SELECT id, url, browse_node_id, model, session_id, status, "
+            "created_at, updated_at, workspace_path, error, owner_id, is_public "
+            "FROM tasks"
+        ).fetchall()
         tasks = {}
-        changed = False
-        for tid, data in raw.items():
-            task = _reconcile_task(Task(**data))
-            tasks[tid] = task
-            if task.model_dump() != data:
-                changed = True
-        if changed:
-            _save_tasks(tasks)
+        for r in rows:
+            task = Task(
+                id=r[0], url=r[1], browse_node_id=r[2], model=r[3],
+                session_id=r[4], status=r[5], created_at=r[6],
+                updated_at=r[7], workspace_path=r[8], error=r[9],
+                owner_id=r[10], is_public=bool(r[11]),
+            )
+            task = _reconcile_task(task)
+            tasks[task.id] = task
         return tasks
     except Exception:
+        LOGGER.error("Failed to load tasks from SQLite", exc_info=True)
         return {}
+
+
+def _migrate_tasks_from_json() -> None:
+    """将 tasks.json 数据迁移到 SQLite。"""
+    try:
+        raw = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+        for tid, data in raw.items():
+            _db.execute(
+                "INSERT OR IGNORE INTO tasks "
+                "(id, url, browse_node_id, model, session_id, status, "
+                "created_at, updated_at, workspace_path, error, owner_id, is_public) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    data.get("id", tid), data.get("url", ""),
+                    data.get("browse_node_id", ""), data.get("model"),
+                    data.get("session_id"), data.get("status", "pending"),
+                    data.get("created_at", ""), data.get("updated_at", ""),
+                    data.get("workspace_path", ""), data.get("error"),
+                    data.get("owner_id"), int(data.get("is_public", False)),
+                ),
+            )
+        _db.commit()
+        # 迁移完成后重命名旧文件
+        backup = TASKS_FILE.with_suffix(".json.bak")
+        TASKS_FILE.rename(backup)
+        LOGGER.info("已将 tasks.json 迁移到 SQLite，旧文件备份为 %s", backup)
+    except Exception:
+        LOGGER.error("tasks.json 迁移失败", exc_info=True)
 
 
 def _save_tasks(tasks: dict[str, Task]) -> None:
-    TASKS_FILE.write_text(
-        json.dumps({tid: t.model_dump() for tid, t in tasks.items()}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    """将任务保存到 SQLite。"""
+    try:
+        for tid, task in tasks.items():
+            _db.execute(
+                "INSERT OR REPLACE INTO tasks "
+                "(id, url, browse_node_id, model, session_id, status, "
+                "created_at, updated_at, workspace_path, error, owner_id, is_public) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task.id, task.url, task.browse_node_id, task.model,
+                    task.session_id, task.status, task.created_at,
+                    task.updated_at, task.workspace_path, task.error,
+                    task.owner_id, int(task.is_public),
+                ),
+            )
+        _db.commit()
+    except Exception:
+        LOGGER.error("Failed to save tasks to SQLite", exc_info=True)
 
 
 def _update_task(task_id: str, **kwargs) -> Task:
+    """更新单个任务的字段。"""
     tasks = _load_tasks()
     if task_id not in tasks:
         raise KeyError(task_id)
@@ -437,7 +822,17 @@ def _update_task(task_id: str, **kwargs) -> Task:
     for k, v in kwargs.items():
         setattr(t, k, v)
     t.updated_at = datetime.utcnow().isoformat()
-    _save_tasks(tasks)
+    # 直接更新 SQLite 中的单条记录
+    try:
+        _db.execute(
+            "UPDATE tasks SET status=?, updated_at=?, error=?, session_id=?, "
+            "workspace_path=?, owner_id=?, is_public=? WHERE id=?",
+            (t.status, t.updated_at, t.error, t.session_id,
+             t.workspace_path, t.owner_id, int(t.is_public), task_id),
+        )
+        _db.commit()
+    except Exception:
+        LOGGER.error("Failed to update task '%s' in SQLite", task_id, exc_info=True)
     return t
 
 
@@ -516,7 +911,7 @@ def _stream_upsert(task_id: str, item_id: str, patch: dict) -> dict:
         )
         _db.commit()
     except Exception:
-        pass  # DB write failure must not break the live stream
+        LOGGER.error("SQLite stream_items upsert failed", exc_info=True)
 
     return item
 
@@ -910,6 +1305,20 @@ def _get_report_files(workspace_path: str) -> dict[str, Optional[str]]:
 # ── Background task runner ─────────────────────────────────────────────────────
 
 
+def _load_model_settings(user_id: str) -> dict:
+    """从数据库加载用户的模型配置。"""
+    try:
+        row = _db.execute(
+            "SELECT api_key, base_url, model FROM model_settings WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row:
+            return {"api_key": row[0] or "", "base_url": row[1] or "", "model": row[2] or ""}
+    except Exception:
+        LOGGER.error("Failed to load model settings for user '%s'", user_id, exc_info=True)
+    return {"api_key": "", "base_url": "", "model": ""}
+
+
 def _build_analysis_prompt(task: Task, mode: str = "full") -> str:
     mode_intro = {
         "full": "请分析这个类目的 Amazon Bestsellers Top50。",
@@ -951,12 +1360,24 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
     _retried = False
     _skip_cleanup = False
 
+    # 从数据库加载用户模型配置
+    model_settings = {"api_key": "", "base_url": "", "model": ""}
+    if task.owner_id:
+        model_settings = _load_model_settings(task.owner_id)
+
     try:
         while True:
             _skip_cleanup = False
             cmd = ["claude"]
             if task.session_id:
                 cmd.extend(["--resume", task.session_id])
+
+            # 应用用户自定义模型配置
+            if model_settings.get("model"):
+                cmd.extend(["--model", model_settings["model"]])
+            elif task.model:
+                cmd.extend(["--model", task.model])
+
             cmd.extend([
                 "-p", prompt,
                 "--plugin-dir", PLUGIN_DIR,
@@ -966,8 +1387,6 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
                 "--verbose",
                 "--include-partial-messages",
             ])
-            if task.model:
-                cmd.extend(["--model", task.model])
 
             if task.session_id:
                 _log_and_stream(task_id, f"[SYSTEM] Resume session: {task.session_id}")
@@ -983,9 +1402,26 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
             proc = _spawn_process(cmd)
             _running_processes[task_id] = proc
 
-            await _read_process_lines(proc, _on_line)
-
-            await _wait_process(proc)
+            _ANALYSIS_TIMEOUT = 2 * 60 * 60  # 2 小时超时
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        _read_process_lines(proc, _on_line),
+                        _wait_process(proc),
+                    ),
+                    timeout=_ANALYSIS_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                LOGGER.error("分析任务 '%s' 超时（%d 秒），强制终止子进程", task_id, _ANALYSIS_TIMEOUT)
+                _log_and_stream(task_id, f"[SYSTEM] ❌ 分析超时（{_ANALYSIS_TIMEOUT // 3600} 小时），强制终止进程")
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                _running_processes.pop(task_id, None)
+                _update_task(task_id, status=TaskStatus.FAILED, error=f"分析超时（{_ANALYSIS_TIMEOUT // 3600} 小时）")
+                _clear_browse_node_active(task.browse_node_id, task_id)
+                return
             _running_processes.pop(task_id, None)
 
             # ── Stale session fallback ──────────────────────────────────
@@ -996,7 +1432,7 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
                     task.session_id = None
                     _update_task(task_id, session_id=None)
                     _save_analysis_meta(task.workspace_path, {"session_id": ""})
-                    _reset_task_stream(task_id)
+                    # R4: Do NOT call _reset_task_stream — preserve existing stream items
                     _log_and_stream(task_id, f"[SYSTEM] 启动分析任务（重试）: {task.url}")
                     _log_and_stream(task_id, f"[SYSTEM] Workspace: {task.workspace_path}")
                     _retried = True
@@ -1137,29 +1573,238 @@ async def _progress_generator(task_id: str) -> AsyncGenerator[dict, None]:
 
 app = FastAPI(title="Amazon Bestsellers Summary API", version="1.0.0")
 
+# 速率限制
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return StreamingResponse(
+        iter([json.dumps({"detail": "请求过于频繁，请稍后重试"})]),
+        status_code=429,
+        media_type="application/json",
+    )
+
+_cors_origins_str = os.environ.get("CORS_ORIGINS", "http://localhost:5173")
+_cors_origins = [o.strip() for o in _cors_origins_str.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.post("/api/tasks", response_model=Task)
-async def create_task(req: CreateTaskRequest, background_tasks=None):
+# ── JWT 认证中间件 ────────────────────────────────────────────────────────────
+
+@app.middleware("http")
+async def jwt_auth_middleware(request: Request, call_next):
+    """对 /api 下非豁免路径强制 JWT 认证。支持 Authorization header 和 ?token= 查询参数。"""
+    path = request.url.path
+    if path.startswith("/api") and path not in _AUTH_EXEMPT_PATHS:
+        # 优先从 header 获取，其次从 query 参数获取（SSE 场景）
+        auth = request.headers.get("Authorization", "")
+        token = None
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+        else:
+            token = request.query_params.get("token")
+        if not token:
+            return StreamingResponse(
+                iter([json.dumps({"detail": "未登录，请先登录"})]),
+                status_code=401,
+                media_type="application/json",
+            )
+        payload = _decode_jwt(token)
+        if payload is None:
+            return StreamingResponse(
+                iter([json.dumps({"detail": "Token 无效或已过期"})]),
+                status_code=401,
+                media_type="application/json",
+            )
+    return await call_next(request)
+
+
+# ── 认证接口 ──────────────────────────────────────────────────────────────────
+
+@app.post("/api/auth/register")
+async def register(req: RegisterRequest):
+    if len(req.username) < 2 or len(req.username) > 50:
+        raise HTTPException(status_code=400, detail="用户名长度需在 2-50 之间")
+    if len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="密码长度至少 6 位")
+    user_id = str(uuid.uuid4())[:12]
+    now = datetime.utcnow().isoformat()
+    password_hash = _hash_password(req.password)
+    try:
+        _db.execute(
+            "INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, req.username, password_hash, now),
+        )
+        _db.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="用户名已存在")
+    token = _create_jwt(user_id, req.username)
+    return {"user_id": user_id, "username": req.username, "token": token}
+
+
+@app.post("/api/auth/login")
+@limiter.limit("5/minute")
+async def login(req: LoginRequest, request: Request):
+    row = _db.execute(
+        "SELECT id, username, password_hash FROM users WHERE username = ?",
+        (req.username,),
+    ).fetchone()
+    if row is None or not _verify_password(req.password, row[2]):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    token = _create_jwt(row[0], row[1])
+    return {"user_id": row[0], "username": row[1], "token": token}
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request):
+    user_id = _require_user(request)
+    row = _db.execute(
+        "SELECT id, username, created_at FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return {"user_id": row[0], "username": row[1], "created_at": row[2]}
+
+
+# ── 模型配置接口 ────────────────────────────────────────────────────────────
+
+@app.get("/api/settings/model")
+async def get_model_settings(request: Request):
+    """获取当前用户的模型配置。"""
+    user_id = _require_user(request)
+    row = _db.execute(
+        "SELECT api_key, base_url, model, created_at, updated_at FROM model_settings WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    if row is None:
+        return {"api_key": "", "base_url": "", "model": "", "created_at": "", "updated_at": ""}
+    return {
+        "api_key": row[0],
+        "base_url": row[1],
+        "model": row[2],
+        "created_at": row[3],
+        "updated_at": row[4],
+    }
+
+
+@app.put("/api/settings/model")
+async def update_model_settings(req: ModelSettingsRequest, request: Request):
+    """更新当前用户的模型配置。"""
+    user_id = _require_user(request)
+    now = datetime.utcnow().isoformat()
+
+    # 读取现有配置
+    existing = _db.execute(
+        "SELECT api_key, base_url, model FROM model_settings WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+
+    api_key = req.api_key if req.api_key is not None else (existing[0] if existing else "")
+    base_url = req.base_url if req.base_url is not None else (existing[1] if existing else "")
+    model = req.model if req.model is not None else (existing[2] if existing else "")
+
+    _db.execute(
+        """INSERT INTO model_settings (user_id, api_key, base_url, model, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+               api_key = excluded.api_key,
+               base_url = excluded.base_url,
+               model = excluded.model,
+               updated_at = excluded.updated_at
+        """,
+        (user_id, api_key, base_url, model, now if not existing else existing[0], now),
+    )
+    _db.commit()
+    return {"api_key": api_key, "base_url": base_url, "model": model, "updated_at": now}
+
+
+# ── Credits 接口 ─────────────────────────────────────────────────────────────
+
+@app.post("/api/credits/record")
+async def record_credits(req: CreditsRecordRequest, request: Request):
+    """记录一次 API 使用量。"""
+    user_id = _require_user(request)
+    now = datetime.utcnow().isoformat()
+
+    # 读取现有 credits
+    existing = _db.execute(
+        "SELECT cache_hit_input, cache_miss_input, output, total_used FROM credits WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+
+    cache_hit = (existing[0] if existing else 0) + req.cache_hit_input
+    cache_miss = (existing[1] if existing else 0) + req.cache_miss_input
+    output = (existing[2] if existing else 0) + req.output_tokens
+    total = cache_hit + cache_miss + output
+
+    _db.execute(
+        """INSERT INTO credits (user_id, cache_hit_input, cache_miss_input, output, total_used, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+               cache_hit_input = excluded.cache_hit_input,
+               cache_miss_input = excluded.cache_miss_input,
+               output = excluded.output,
+               total_used = excluded.total_used,
+               updated_at = excluded.updated_at
+        """,
+        (user_id, cache_hit, cache_miss, output, total, now),
+    )
+    _db.commit()
+    return {
+        "cache_hit_input": cache_hit,
+        "cache_miss_input": cache_miss,
+        "output": output,
+        "total_used": total,
+    }
+
+
+@app.get("/api/credits")
+async def get_credits(request: Request):
+    """查询用户 Credits 余额。"""
+    user_id = _require_user(request)
+    row = _db.execute(
+        "SELECT cache_hit_input, cache_miss_input, output, total_used, updated_at FROM credits WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    if row is None:
+        return {
+            "cache_hit_input": 0,
+            "cache_miss_input": 0,
+            "output": 0,
+            "total_used": 0,
+            "updated_at": "",
+        }
+    return {
+        "cache_hit_input": row[0],
+        "cache_miss_input": row[1],
+        "output": row[2],
+        "total_used": row[3],
+        "updated_at": row[4],
+    }
+
+
+@app.post("/api/tasks", response_model=Task, response_model_exclude={"workspace_path"})
+@limiter.limit("10/minute")
+async def create_task(req: CreateTaskRequest, request: Request):
+    user_id = _require_user(request)
     try:
         browse_node_id = _extract_browse_node_id(req.url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     _assert_browse_node_not_running(browse_node_id)
 
-    task_id = str(uuid.uuid4())[:8]
+    task_id = str(uuid.uuid4())[:12]
     now = datetime.utcnow().isoformat()
-    # Canonical workspace: `APP_DIR/workspace/{browse_node_id}`. This matches
-    # exactly what the orchestrator agent derives as `{CWD}/workspace/{id}`
-    # when the claude subprocess runs with `cwd=APP_DIR`, so backend + agent
-    # never disagree on where data lives.
     workspace_path = str(_resolve_workspace_path(browse_node_id))
     meta = _load_analysis_meta(workspace_path)
     saved_session_id = meta.get("session_id") if isinstance(meta.get("session_id"), str) else None
@@ -1174,6 +1819,7 @@ async def create_task(req: CreateTaskRequest, background_tasks=None):
         created_at=now,
         updated_at=now,
         workspace_path=workspace_path,
+        owner_id=user_id,
     )
 
     tasks = _load_tasks()
@@ -1188,7 +1834,7 @@ async def create_task(req: CreateTaskRequest, background_tasks=None):
     return task
 
 
-@app.post("/api/tasks/{task_id}/resume", response_model=Task)
+@app.post("/api/tasks/{task_id}/resume", response_model=Task, response_model_exclude={"workspace_path"})
 async def resume_task(task_id: str):
     tasks = _load_tasks()
     if task_id not in tasks:
@@ -1216,7 +1862,7 @@ async def resume_task(task_id: str):
     return task
 
 
-@app.post("/api/tasks/{task_id}/refresh", response_model=Task)
+@app.post("/api/tasks/{task_id}/refresh", response_model=Task, response_model_exclude={"workspace_path"})
 async def refresh_task(task_id: str):
     """Incremental update: re-crawl category list for latest ranks, then only
     process new/changed ASINs and re-run analysts + summary.
@@ -1261,18 +1907,22 @@ async def refresh_task(task_id: str):
     return task
 
 
-@app.post("/api/tasks/{task_id}/reanalyze", response_model=Task)
-async def reanalyze_task(task_id: str):
+@app.post("/api/tasks/{task_id}/reanalyze", response_model=Task, response_model_exclude={"workspace_path"})
+async def reanalyze_task(task_id: str, request: Request):
     """Full re-analysis: wipe the workspace clean and start from scratch.
 
     Clears all crawled data, chunks, reports, and the Claude session so the
     next run is a completely fresh analysis — no residual state from the
     previous run.
     """
+    user_id = _require_user(request)
     tasks = _load_tasks()
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     task = tasks[task_id]
+    # T2: 权限校验 — 只有任务创建者可以全量重新分析
+    if task.owner_id and task.owner_id != user_id:
+        raise HTTPException(status_code=403, detail="无权操作他人的任务")
     if task.status == TaskStatus.RUNNING and task_id in _running_processes:
         raise HTTPException(status_code=409, detail="Task is already running")
     _assert_browse_node_not_running(task.browse_node_id, exclude_task_id=task_id)
@@ -1286,12 +1936,17 @@ async def reanalyze_task(task_id: str):
             if child.name == ANALYSIS_META_FILE:
                 continue  # handled separately below
             if child.is_dir():
-                shutil.rmtree(child, ignore_errors=True)
+                try:
+                    shutil.rmtree(child)
+                except Exception as e:
+                    LOGGER.error("Failed to remove workspace subdir '%s': %s", child, e)
+                    _update_task(task_id, status=TaskStatus.FAILED, error=f"Workspace cleanup failed: {e}. Please manually delete the workspace directory and retry.")
+                    return task
             else:
                 try:
                     child.unlink()
-                except Exception:
-                    pass
+                except Exception as e:
+                    LOGGER.error("Failed to remove workspace file '%s': %s", child, e)
 
     # Clear session_id from both task record and workspace meta
     task.session_id = None
@@ -1311,13 +1966,34 @@ async def reanalyze_task(task_id: str):
     return task
 
 
-@app.get("/api/tasks", response_model=list[Task])
-async def list_tasks():
+@app.get("/api/tasks", response_model=list[Task], response_model_exclude={"workspace_path"})
+async def list_tasks(
+    request: Request,
+    all: bool = False,
+    status: Optional[str] = None,
+    keyword: Optional[str] = None,
+):
+    """T15: 支持按状态和关键词筛选任务。
+
+    - status: 按任务状态筛选（running/completed/failed/cancelled）
+    - keyword: 按 browse_node_id 或 URL 关键词搜索
+    - all: 是否显示公开任务
+    """
+    user_id = _require_user(request)
     tasks = _load_tasks()
-    return sorted(tasks.values(), key=lambda t: t.created_at, reverse=True)
+    if all:
+        filtered = [t for t in tasks.values() if t.owner_id == user_id or t.is_public]
+    else:
+        filtered = [t for t in tasks.values() if t.owner_id == user_id]
+    if status:
+        filtered = [t for t in filtered if t.status == status]
+    if keyword:
+        kw = keyword.lower()
+        filtered = [t for t in filtered if kw in t.browse_node_id.lower() or kw in t.url.lower()]
+    return sorted(filtered, key=lambda t: t.created_at, reverse=True)
 
 
-@app.get("/api/tasks/{task_id}", response_model=Task)
+@app.get("/api/tasks/{task_id}", response_model=Task, response_model_exclude={"workspace_path"})
 async def get_task(task_id: str):
     tasks = _load_tasks()
     if task_id not in tasks:
@@ -1343,7 +2019,7 @@ async def get_reports(task_id: str):
     phases = _build_progress_from_workspace(task.workspace_path)
     return {
         "task_id": task_id,
-        "workspace_path": task.workspace_path,
+        "browse_node_id": task.browse_node_id,
         "reports": reports,
         "phases": phases,
     }
@@ -1406,6 +2082,11 @@ async def chat_with_task(task_id: str, req: ChatRequest):
     task = tasks[task_id]
     _assert_browse_node_not_running(task.browse_node_id)
 
+    # R12: prevent concurrent chat requests on the same task
+    if task_id in _active_chat_tasks:
+        raise HTTPException(status_code=409, detail="A chat request is already in progress for this task")
+    _active_chat_tasks[task_id] = True
+
     # Inject workspace context into the prompt so Claude knows what we're discussing
     context = (
         f"[上下文：当前分析的 Amazon Bestsellers 类目 URL 为 {task.url}，"
@@ -1455,61 +2136,68 @@ async def chat_with_task(task_id: str, req: ChatRequest):
         # Persist user message
         _save_chat_message(task_id, "user", req.message)
         _assistant_text_buf: list[str] = []
-        while True:
-            cmd = _build_chat_cmd(task.session_id)
-            try:
-                proc = _spawn_process(cmd)
-                _session_not_found = False
-                if proc.stdout is not None:
-                    while True:
-                        raw = await asyncio.to_thread(proc.stdout.readline)
-                        if raw == "":
-                            if proc.poll() is not None:
+        try:
+            while True:
+                cmd = _build_chat_cmd(task.session_id)
+                try:
+                    proc = _spawn_process(cmd)
+                    _session_not_found = False
+                    if proc.stdout is not None:
+                        while True:
+                            raw = await asyncio.to_thread(proc.stdout.readline)
+                            if raw == "":
+                                if proc.poll() is not None:
+                                    break
+                                await asyncio.sleep(0.05)
+                                continue
+                            # Detect stale session early, before streaming any content
+                            if "No conversation found with session ID" in raw and task.session_id and not _chat_retried:
+                                _session_not_found = True
                                 break
-                            await asyncio.sleep(0.05)
-                            continue
-                        # Detect stale session early, before streaming any content
-                        if "No conversation found with session ID" in raw and task.session_id and not _chat_retried:
-                            _session_not_found = True
-                            break
-                        session_id = _extract_stream_session_id(raw)
-                        if session_id:
-                            _persist_task_session_id(task_id, session_id)
-                        for chunk in _extract_text_chunks(raw):
-                            if chunk:
-                                _assistant_text_buf.append(chunk)
-                                yield f"data: {json.dumps({'text': chunk})}\n\n"
-                # ── Stale session fallback ──
-                if _session_not_found and task.session_id and not _chat_retried:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    task.session_id = None
-                    _update_task(task_id, session_id=None)
-                    _save_analysis_meta(task.workspace_path, {"session_id": ""})
-                    _chat_retried = True
-                    continue  # retry without --resume
-                await _wait_process(proc)
-                # Persist assistant response
-                if _assistant_text_buf:
-                    _save_chat_message(task_id, "assistant", "".join(_assistant_text_buf))
-                yield f"data: {json.dumps({'done': True})}\n\n"
-            except FileNotFoundError:
-                yield f"data: {json.dumps({'error': 'claude CLI not found'})}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            break  # done (retry uses continue)
+                            session_id = _extract_stream_session_id(raw)
+                            if session_id:
+                                _persist_task_session_id(task_id, session_id)
+                            for chunk in _extract_text_chunks(raw):
+                                if chunk:
+                                    _assistant_text_buf.append(chunk)
+                                    yield f"data: {json.dumps({'text': chunk})}\n\n"
+                    # ── Stale session fallback ──
+                    if _session_not_found and task.session_id and not _chat_retried:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        task.session_id = None
+                        _update_task(task_id, session_id=None)
+                        _save_analysis_meta(task.workspace_path, {"session_id": ""})
+                        _chat_retried = True
+                        continue  # retry without --resume
+                    await _wait_process(proc)
+                    # Persist assistant response
+                    if _assistant_text_buf:
+                        _save_chat_message(task_id, "assistant", "".join(_assistant_text_buf))
+                    yield f"data: {json.dumps({'done': True})}\n\n"
+                except FileNotFoundError:
+                    yield f"data: {json.dumps({'error': 'claude CLI not found'})}\n\n"
+                except Exception as e:
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                break  # done (retry uses continue)
+        finally:
+            _active_chat_tasks.pop(task_id, None)
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
 
 
 @app.delete("/api/tasks/{task_id}")
-async def delete_task(task_id: str):
+async def delete_task(task_id: str, request: Request):
+    user_id = _require_user(request)
     tasks = _load_tasks()
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     task = tasks[task_id]
+    # T2: 权限校验 — 只有任务创建者可以删除
+    if task.owner_id and task.owner_id != user_id:
+        raise HTTPException(status_code=403, detail="无权删除他人的任务")
     # Kill running process if any
     proc = _running_processes.pop(task_id, None)
     if proc:
@@ -1519,12 +2207,48 @@ async def delete_task(task_id: str):
             pass
     _clear_browse_node_active(task.browse_node_id, task_id)
     _delete_task_history(task_id)
+    _delete_sessions_for_task(task_id)
     # Clear session_id from workspace meta so future tasks for the same
     # browse_node_id don't try to resume a stale session.
     _save_analysis_meta(task.workspace_path, {"session_id": ""})
-    del tasks[task_id]
-    _save_tasks(tasks)
+    # 从 SQLite 删除任务记录
+    try:
+        _db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        _db.commit()
+    except Exception:
+        LOGGER.error("Failed to delete task '%s' from SQLite", task_id, exc_info=True)
     return {"ok": True}
+
+
+@app.post("/api/tasks/{task_id}/cancel", response_model=Task, response_model_exclude={"workspace_path"})
+async def cancel_task(task_id: str, request: Request):
+    """取消运行中的任务。保留 workspace 中间数据。"""
+    user_id = _require_user(request)
+    tasks = _load_tasks()
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = tasks[task_id]
+    # 权限校验
+    if task.owner_id and task.owner_id != user_id:
+        raise HTTPException(status_code=403, detail="无权取消他人的任务")
+    if task.status not in (TaskStatus.RUNNING, TaskStatus.PENDING):
+        raise HTTPException(status_code=409, detail=f"任务状态为 {task.status}，无法取消")
+    # 终止子进程
+    proc = _running_processes.pop(task_id, None)
+    if proc:
+        try:
+            proc.terminate()
+            # 等待 5 秒，如果还没退出就 kill
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except Exception:
+            LOGGER.warning("终止子进程失败: task_id=%s", task_id, exc_info=True)
+    _clear_browse_node_active(task.browse_node_id, task_id)
+    _update_task(task_id, status=TaskStatus.CANCELLED, error="用户取消")
+    _log_and_stream(task_id, "[SYSTEM] ❌ 任务已被用户取消")
+    return _load_tasks()[task_id]
 
 
 @app.get("/api/tasks/{task_id}/history")
@@ -1549,10 +2273,95 @@ async def get_task_history(task_id: str):
     }
 
 
+# ── 健康检查缓存 ──────────────────────────────────────────────────────────────
+_health_cache: dict = {}
+_health_cache_ts: float = 0.0
+_HEALTH_CACHE_TTL = 10  # 秒
+_claude_available_cache: dict = {}
+_claude_cache_ts: float = 0.0
+_CLAUDE_CACHE_TTL = 300  # 5 分钟
+
+
+def _check_database() -> str:
+    """检测 SQLite 数据库连接是否正常。"""
+    try:
+        _db.execute("SELECT 1")
+        return "ok"
+    except Exception as e:
+        LOGGER.error("Health check: database error: %s", e)
+        return "error"
+
+
+def _check_disk() -> str:
+    """检测磁盘空间。"""
+    try:
+        import psutil
+        usage = psutil.disk_usage(str(APP_DIR))
+        pct = usage.percent
+        if pct >= 95:
+            return "critical"
+        if pct >= 85:
+            return "warning"
+        return "ok"
+    except ImportError:
+        # psutil 未安装时跳过磁盘检测
+        return "unknown"
+    except Exception as e:
+        LOGGER.error("Health check: disk error: %s", e)
+        return "error"
+
+
+def _check_claude() -> bool:
+    """检测 Claude CLI 是否可用（结果缓存 5 分钟）。"""
+    global _claude_available_cache, _claude_cache_ts
+    now = datetime.utcnow().timestamp()
+    if _claude_cache_ts and (now - _claude_cache_ts) < _CLAUDE_CACHE_TTL:
+        return _claude_available_cache.get("available", False)
+    try:
+        result = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        available = result.returncode == 0
+    except Exception:
+        available = False
+    _claude_available_cache = {"available": available}
+    _claude_cache_ts = now
+    return available
+
+
 @app.get("/api/health")
 async def health():
-    return {
-        "status": "ok",
+    """系统健康检查接口，结果缓存 10 秒。"""
+    global _health_cache, _health_cache_ts
+    now = datetime.utcnow().timestamp()
+    if _health_cache_ts and (now - _health_cache_ts) < _HEALTH_CACHE_TTL:
+        return _health_cache
+
+    db_status = _check_database()
+    disk_status = _check_disk()
+    claude_ok = _check_claude()
+    active_count = len(_running_processes)
+
+    # 综合状态判定
+    if db_status == "error" or disk_status == "critical":
+        overall = "unhealthy"
+    elif disk_status == "warning" or not claude_ok:
+        overall = "degraded"
+    else:
+        overall = "healthy"
+
+    result = {
+        "status": overall,
+        "components": {
+            "database": db_status,
+            "disk_space": disk_status,
+            "claude_available": claude_ok,
+            "active_tasks": active_count,
+        },
+        "version": "1.0.0",
         "workspace_base": str(WORKSPACE_BASE),
-        "subprocess_cwd": str(SUBPROCESS_CWD),
     }
+    _health_cache = result
+    _health_cache_ts = now
+    return result
