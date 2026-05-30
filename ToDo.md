@@ -44,6 +44,7 @@
 - [x] Docker Claude CLI 安装（固定版本 v1.0.45）
 - [x] 前端 UI 改进（参考 Claude 聊天页面风格）
 - [x] Auth 页面居中（已确认居中）
+- [x] README Credits API 说明补全（自动记录，无需手动调用）
 
 ## Phase 7：UI 优化（进行中）
 
