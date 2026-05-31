@@ -12,9 +12,9 @@ workspace/
 md/
 
 # local browser artifacts
-.playwright-cli/
-.playwright-mcp/
-test-results/
+**/.playwright-cli/
+**/.playwright-mcp/
+**/test-results/
 
 # logs
 *.log
