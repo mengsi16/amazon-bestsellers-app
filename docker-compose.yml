@@ -11,9 +11,11 @@ services:
       - ENV=production
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - CORS_ORIGINS=http://localhost
+      - CREDITS_ENCRYPTION_KEY=${CREDITS_ENCRYPTION_KEY}
+      - DB_PATH=/app/data/conversations.db
     volumes:
       - backend-data:/app/workspace
-      - ./backend/conversations.db:/app/conversations.db
+      - backend-db:/app/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
@@ -34,3 +36,4 @@ services:
 
 volumes:
   backend-data:
+  backend-db:
