@@ -43,7 +43,7 @@ import aiofiles
 import bcrypt
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from slowapi import Limiter
@@ -69,6 +69,9 @@ SUBPROCESS_CWD = APP_DIR
 # Simple JSON file-based task store
 TASKS_FILE = BACKEND_DIR / "tasks.json"
 ANALYSIS_META_FILE = ".analysis_meta.json"
+DEFAULT_SONNET_MODEL = "claude-3-5-sonnet-20241022"
+DEFAULT_OPUS_MODEL = "claude-opus-4-7"
+DEFAULT_MODEL_FAMILY = "sonnet"
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -88,7 +91,7 @@ DB_PATH = BACKEND_DIR / "conversations.db"
 
 def _init_db() -> sqlite3.Connection:
     """Create tables if they don't exist and return a connection."""
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS stream_items (
@@ -188,6 +191,25 @@ def _init_db() -> sqlite3.Connection:
             created_at      TEXT NOT NULL DEFAULT ''
         )
     """)
+    model_config_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(model_configs)").fetchall()
+    }
+    if "sonnet_model" not in model_config_columns:
+        conn.execute(
+            "ALTER TABLE model_configs "
+            "ADD COLUMN sonnet_model TEXT NOT NULL DEFAULT 'claude-3-5-sonnet-20241022'"
+        )
+    if "opus_model" not in model_config_columns:
+        conn.execute("ALTER TABLE model_configs ADD COLUMN opus_model TEXT NOT NULL DEFAULT 'opus'")
+    if "default_model_family" not in model_config_columns:
+        conn.execute(
+            "ALTER TABLE model_configs "
+            "ADD COLUMN default_model_family TEXT NOT NULL DEFAULT 'sonnet'"
+        )
+    conn.execute(
+        "UPDATE model_configs SET sonnet_model = model "
+        "WHERE sonnet_model IS NULL OR sonnet_model = '' OR sonnet_model = 'claude-3-5-sonnet-20241022'"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_model_configs_user ON model_configs(user_id)")
     # credits_log 表 — API 使用量明细
     conn.execute("""
@@ -236,19 +258,29 @@ def _encrypt_api_key(api_key: str) -> str:
     try:
         f = _get_fernet()
         return f.encrypt(api_key.encode()).decode()
-    except Exception:
-        LOGGER.warning("API key 加密失败，将存储明文")
-        return api_key
+    except Exception as exc:
+        LOGGER.error(
+            "API key 加密失败，exception_type=%s，api_key_len=%d",
+            type(exc).__name__,
+            len(api_key),
+            exc_info=True,
+        )
+        raise
 
 
 def _decrypt_api_key(encrypted: str) -> str:
-    """解密 API key。"""
+    """解密 API key。失败时返回空字符串而非抛异常——避免 create_task 因 key 解密失败返回纯文本 500。"""
     try:
         f = _get_fernet()
         return f.decrypt(encrypted.encode()).decode()
-    except Exception:
-        # 可能不是加密的，直接返回
-        return encrypted
+    except Exception as exc:
+        LOGGER.error(
+            "API key 解密失败，exception_type=%s，encrypted_len=%d — 返回空字符串降级",
+            type(exc).__name__,
+            len(encrypted),
+            exc_info=True,
+        )
+        return ""
 
 
 # ── JWT 认证 ──────────────────────────────────────────────────────────────────
@@ -431,6 +463,7 @@ class Task(BaseModel):
 class CreateTaskRequest(BaseModel):
     url: str
     model: Optional[str] = None
+    model_family: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -441,7 +474,10 @@ class ChatRequest(BaseModel):
 
 class ModelConfigCreate(BaseModel):
     name: str
-    model: str = "claude-3-5-sonnet-20241022"
+    model: Optional[str] = None
+    sonnet_model: Optional[str] = None
+    opus_model: Optional[str] = None
+    default_model_family: Optional[str] = None
     api_key: str  # 明文传入，内部加密存储
     base_url: Optional[str] = None
     is_default: bool = False
@@ -450,6 +486,9 @@ class ModelConfigCreate(BaseModel):
 class ModelConfigUpdate(BaseModel):
     name: Optional[str] = None
     model: Optional[str] = None
+    sonnet_model: Optional[str] = None
+    opus_model: Optional[str] = None
+    default_model_family: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     is_default: Optional[bool] = None
@@ -485,11 +524,19 @@ _task_stream_version: dict[str, int] = {}
 # task_id -> parser state dict (current message / text block / tool block)
 _task_parser_state: dict[str, dict] = {}
 
+# task_id -> task context (owner_id, model, etc.) 用于 credits 记录
+_task_context: dict[str, dict] = {}
+
+# task_id -> credits recorded flag (prevent double recording)
+_task_credits_recorded: dict[str, bool] = {}
+
 
 # ── 优雅停机 ─────────────────────────────────────────────────────────────────
 
 def _cleanup_on_shutdown():
     """进程退出时清理所有运行中的子进程。"""
+    if not _running_processes:
+        return
     LOGGER.info("正在清理 %d 个运行中的子进程...", len(_running_processes))
     for task_id, proc in list(_running_processes.items()):
         try:
@@ -533,6 +580,50 @@ def _normalize_error_message(value: object, fallback: str) -> str:
     return fallback
 
 
+# ── Credits 记录 ──────────────────────────────────────────────────────────────
+
+def _record_credits_from_result(task_id: str, ev: dict) -> None:
+    """从 stream-json result 事件中提取 usage 信息并写入 credits_log。"""
+    if _task_credits_recorded.get(task_id):
+        return  # 防止重复记录
+
+    ctx = _task_context.get(task_id, {})
+    owner_id = ctx.get("owner_id")
+    if not owner_id:
+        return
+
+    usage = ev.get("usage", {})
+    cache_hit = usage.get("cache_hit_input", 0)
+    cache_miss = usage.get("cache_miss_input", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    total_cost = ev.get("total_cost_usd", 0.0)
+    model = ctx.get("model", "")
+
+    # 如果 usage 中没有 cache 字段，全部计入 cache_miss_input
+    if not usage.get("cache_hit_input") and not usage.get("cache_miss_input"):
+        total_input = usage.get("input_tokens", 0)
+        if total_input > 0:
+            cache_miss = total_input
+            cache_hit = 0
+
+    if cache_hit == 0 and cache_miss == 0 and output_tokens == 0:
+        return  # 无使用量，跳过
+
+    now = datetime.utcnow().isoformat()
+    try:
+        _db.execute(
+            """INSERT INTO credits_log (task_id, user_id, cache_hit_input, cache_miss_input, output_tokens, cost_usd, model, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (task_id, owner_id, cache_hit, cache_miss, output_tokens, total_cost, model or "", now),
+        )
+        _db.commit()
+        _task_credits_recorded[task_id] = True
+        LOGGER.info("记录 credits: task_id=%s, cache_hit=%d, cache_miss=%d, output=%d, cost=%.4f",
+                    task_id, cache_hit, cache_miss, output_tokens, total_cost)
+    except Exception:
+        LOGGER.error("Failed to record credits for task '%s'", task_id, exc_info=True)
+
+
 # ── Canonical workspace ────────────────────────────────────────────────────────
 # Single source of truth: every task for a given `browse_node_id` lives at
 # `APP_DIR/workspace/{browse_node_id}`.
@@ -572,12 +663,20 @@ def _load_analysis_meta(workspace_path: str | Path) -> dict:
 
 
 def _save_analysis_meta(workspace_path: str | Path, patch: dict) -> None:
-    workspace = Path(workspace_path)
-    workspace.mkdir(parents=True, exist_ok=True)
-    meta_path = _analysis_meta_path(workspace)
-    current = _load_analysis_meta(workspace)
-    merged = {**current, **patch}
-    meta_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    """写 analysis_meta.json，失败仅 log 不抛异常——元数据写入不应阻塞任务创建。"""
+    try:
+        workspace = Path(workspace_path)
+        workspace.mkdir(parents=True, exist_ok=True)
+        meta_path = _analysis_meta_path(workspace)
+        current = _load_analysis_meta(workspace)
+        merged = {**current, **patch}
+        meta_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        LOGGER.error(
+            "保存 analysis_meta 失败，workspace=%s，exception_type=%s",
+            workspace_path, type(exc).__name__,
+            exc_info=True,
+        )
 
 
 def _sync_task_analysis_meta(task: Task) -> None:
@@ -1189,6 +1288,8 @@ def _feed_stream_line(task_id: str, raw_line: str) -> None:
             },
             "final": True,
         })
+        # 记录 credits 使用量
+        _record_credits_from_result(task_id, ev)
         return
 
 
@@ -1205,7 +1306,8 @@ def _reset_task_stream(task_id: str) -> None:
     }
 
 
-def _spawn_process(cmd: list[str]) -> subprocess.Popen:
+def _spawn_process(cmd: list[str], env_extra: Optional[dict] = None) -> subprocess.Popen:
+    """启动子进程，可选注入额外环境变量。"""
     return subprocess.Popen(
         cmd,
         cwd=str(SUBPROCESS_CWD),
@@ -1215,6 +1317,7 @@ def _spawn_process(cmd: list[str]) -> subprocess.Popen:
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        env=(dict(os.environ, **env_extra) if env_extra else None),
     )
 
 
@@ -1305,18 +1408,98 @@ def _get_report_files(workspace_path: str) -> dict[str, Optional[str]]:
 # ── Background task runner ─────────────────────────────────────────────────────
 
 
-def _load_model_settings(user_id: str) -> dict:
-    """从数据库加载用户的模型配置。"""
-    try:
-        row = _db.execute(
-            "SELECT api_key, base_url, model FROM model_settings WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        if row:
-            return {"api_key": row[0] or "", "base_url": row[1] or "", "model": row[2] or ""}
-    except Exception:
-        LOGGER.error("Failed to load model settings for user '%s'", user_id, exc_info=True)
-    return {"api_key": "", "base_url": "", "model": ""}
+def _normalize_model_family(model_family: Optional[str]) -> str:
+    family = (model_family or DEFAULT_MODEL_FAMILY).strip().lower()
+    if family not in {"sonnet", "opus"}:
+        raise HTTPException(status_code=400, detail="model_family 只能是 sonnet 或 opus")
+    return family
+
+
+def _resolve_model_config_fields(
+    model: Optional[str],
+    sonnet_model: Optional[str],
+    opus_model: Optional[str],
+    default_model_family: Optional[str],
+) -> dict:
+    resolved_sonnet = (sonnet_model or model or DEFAULT_SONNET_MODEL).strip()
+    resolved_opus = (opus_model or DEFAULT_OPUS_MODEL).strip()
+    resolved_family = _normalize_model_family(default_model_family)
+    return {
+        "model": resolved_sonnet,
+        "sonnet_model": resolved_sonnet,
+        "opus_model": resolved_opus,
+        "default_model_family": resolved_family,
+    }
+
+
+def _model_config_response(row) -> dict:
+    return {
+        "id": row[0],
+        "name": row[1],
+        "model": row[3] or row[2] or DEFAULT_SONNET_MODEL,
+        "sonnet_model": row[3] or row[2] or DEFAULT_SONNET_MODEL,
+        "opus_model": row[4] or DEFAULT_OPUS_MODEL,
+        "default_model_family": row[5] or DEFAULT_MODEL_FAMILY,
+        "base_url": row[6] or "",
+        "has_api_key": bool(row[7]),
+        "is_default": bool(row[8]),
+        "created_at": row[9],
+    }
+
+
+def _load_default_model_config(user_id: Optional[str]) -> Optional[dict]:
+    if not user_id:
+        return None
+    row = _db.execute(
+        """SELECT id, name, model, sonnet_model, opus_model, default_model_family,
+                  base_url, api_key_encrypted, is_default, created_at
+           FROM model_configs
+           WHERE user_id = ? AND is_default = 1
+           ORDER BY created_at DESC
+           LIMIT 1""",
+        (user_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row[0],
+        "name": row[1],
+        "model": row[3] or row[2] or DEFAULT_SONNET_MODEL,
+        "sonnet_model": row[3] or row[2] or DEFAULT_SONNET_MODEL,
+        "opus_model": row[4] or DEFAULT_OPUS_MODEL,
+        "default_model_family": row[5] or DEFAULT_MODEL_FAMILY,
+        "base_url": row[6] or "",
+        "api_key": _decrypt_api_key(row[7]) if row[7] else "",
+        "is_default": bool(row[8]),
+        "created_at": row[9],
+    }
+
+
+def _select_config_model(config: Optional[dict], model_family: Optional[str]) -> str:
+    if config is None:
+        return ""
+    family = _normalize_model_family(model_family or config["default_model_family"])
+    if family == "opus":
+        return config["opus_model"]
+    return config["sonnet_model"]
+
+
+def _build_claude_cli_config(
+    user_id: Optional[str],
+    explicit_model: Optional[str] = None,
+    model_family: Optional[str] = None,
+) -> dict:
+    default_config = _load_default_model_config(user_id)
+    model = (explicit_model or "").strip()
+    if not model:
+        model = _select_config_model(default_config, model_family)
+    env_to_set = {}
+    if default_config:
+        if default_config["api_key"]:
+            env_to_set["ANTHROPIC_API_KEY"] = default_config["api_key"]
+        if default_config["base_url"]:
+            env_to_set["ANTHROPIC_BASE_URL"] = default_config["base_url"]
+    return {"model": model, "env": env_to_set, "default_config": default_config}
 
 
 def _build_analysis_prompt(task: Task, mode: str = "full") -> str:
@@ -1360,23 +1543,24 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
     _retried = False
     _skip_cleanup = False
 
-    # 从数据库加载用户模型配置
-    model_settings = {"api_key": "", "base_url": "", "model": ""}
-    if task.owner_id:
-        model_settings = _load_model_settings(task.owner_id)
-
     try:
+        cli_config = _build_claude_cli_config(task.owner_id, explicit_model=task.model)
+
+        # 设置任务上下文，用于 credits 记录
+        _task_context[task_id] = {
+            "owner_id": task.owner_id,
+            "model": cli_config["model"] or task.model,
+        }
+        _task_credits_recorded[task_id] = False
+
         while True:
             _skip_cleanup = False
             cmd = ["claude"]
             if task.session_id:
                 cmd.extend(["--resume", task.session_id])
 
-            # 应用用户自定义模型配置
-            if model_settings.get("model"):
-                cmd.extend(["--model", model_settings["model"]])
-            elif task.model:
-                cmd.extend(["--model", task.model])
+            if cli_config["model"]:
+                cmd.extend(["--model", cli_config["model"]])
 
             cmd.extend([
                 "-p", prompt,
@@ -1399,7 +1583,7 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
 
             proc: Optional[subprocess.Popen] = None
             _update_task(task_id, status=TaskStatus.RUNNING)
-            proc = _spawn_process(cmd)
+            proc = _spawn_process(cmd, env_extra=cli_config["env"] or None)
             _running_processes[task_id] = proc
 
             _ANALYSIS_TIMEOUT = 2 * 60 * 60  # 2 小时超时
@@ -1416,8 +1600,13 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
                 _log_and_stream(task_id, f"[SYSTEM] ❌ 分析超时（{_ANALYSIS_TIMEOUT // 3600} 小时），强制终止进程")
                 try:
                     proc.kill()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    LOGGER.error(
+                        "分析超时后终止进程失败，task_id=%s，exception_type=%s",
+                        task_id,
+                        type(exc).__name__,
+                        exc_info=True,
+                    )
                 _running_processes.pop(task_id, None)
                 _update_task(task_id, status=TaskStatus.FAILED, error=f"分析超时（{_ANALYSIS_TIMEOUT // 3600} 小时）")
                 _clear_browse_node_active(task.browse_node_id, task_id)
@@ -1456,16 +1645,42 @@ async def _run_analysis(task_id: str, task: Task, prompt_override: Optional[str]
                 _update_task(task_id, status=TaskStatus.FAILED, error=err)
                 _log_and_stream(task_id, f"[SYSTEM] ⚠️ Agent 提前结束但未生成 summary.md：{err}")
             else:
-                _update_task(task_id, status=TaskStatus.FAILED, error=f"Exit code {proc.returncode}")
+                # 尝试从日志中提取真实错误原因
+                logs = _task_logs.get(task_id, [])
+                error_reason = None
+                for line in logs:
+                    line_lower = line.lower()
+                    if any(kw in line_lower for kw in ("error", "exception", "traceback", "failed", "cannot", "unable", "invalid")):
+                        # 取第一个包含错误关键词的行
+                        error_reason = line.strip()
+                        if len(error_reason) > 10:
+                            break
+                if error_reason and len(error_reason) < 200:
+                    err = f"Exit code {proc.returncode}: {error_reason}"
+                else:
+                    err = f"Exit code {proc.returncode}"
+                _update_task(task_id, status=TaskStatus.FAILED, error=err)
                 _log_and_stream(task_id, f"[SYSTEM] ❌ 分析失败，退出码: {proc.returncode}")
 
             break  # normal exit (retry uses continue)
 
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        LOGGER.error(
+            "claude CLI 不存在，task_id=%s，exception_type=%s",
+            task_id,
+            type(exc).__name__,
+            exc_info=True,
+        )
         msg = "'claude' 命令未找到，请先安装 Claude Code CLI"
         _update_task(task_id, status=TaskStatus.FAILED, error=msg)
         _log_and_stream(task_id, f"[SYSTEM] ❌ {msg}")
     except Exception as e:
+        LOGGER.error(
+            "分析任务失败，task_id=%s，exception_type=%s",
+            task_id,
+            type(e).__name__,
+            exc_info=True,
+        )
         err = _normalize_error_message(e, "Unexpected internal error")
         _update_task(task_id, status=TaskStatus.FAILED, error=err)
         _log_and_stream(task_id, f"[SYSTEM] ❌ 意外错误: {err}")
@@ -1578,6 +1793,13 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
 
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    """全局异常处理器：确保 500 永远返回 JSON 而非纯文本 'Internal Server Error'。"""
+    LOGGER.error("未捕获的异常，path=%s，exception_type=%s", request.url.path, type(exc).__name__, exc_info=True)
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
+
+
 @app.exception_handler(RateLimitExceeded)
 async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return StreamingResponse(
@@ -1676,121 +1898,204 @@ async def auth_me(request: Request):
     return {"user_id": row[0], "username": row[1], "created_at": row[2]}
 
 
-# ── 模型配置接口 ────────────────────────────────────────────────────────────
+# ── 模型配置接口（新版）───────────────────────────────────────────────────
 
-@app.get("/api/settings/model")
-async def get_model_settings(request: Request):
-    """获取当前用户的模型配置。"""
+@app.get("/api/model-configs")
+async def list_model_configs(request: Request):
+    """列出当前用户的所有模型配置（不返回 api_key）。"""
     user_id = _require_user(request)
-    row = _db.execute(
-        "SELECT api_key, base_url, model, created_at, updated_at FROM model_settings WHERE user_id = ?",
+    rows = _db.execute(
+        """SELECT id, name, model, sonnet_model, opus_model, default_model_family,
+                  base_url, api_key_encrypted, is_default, created_at
+           FROM model_configs
+           WHERE user_id = ?
+           ORDER BY created_at DESC""",
         (user_id,),
-    ).fetchone()
-    if row is None:
-        return {"api_key": "", "base_url": "", "model": "", "created_at": "", "updated_at": ""}
+    ).fetchall()
+    return [_model_config_response(r) for r in rows]
+
+
+@app.post("/api/model-configs")
+async def create_model_config(req: ModelConfigCreate, request: Request):
+    """创建新的模型配置。api_key 会加密存储。"""
+    user_id = _require_user(request)
+    config_id = str(uuid.uuid4())[:12]
+    now = datetime.utcnow().isoformat()
+    encrypted_key = _encrypt_api_key(req.api_key)
+    model_fields = _resolve_model_config_fields(
+        req.model,
+        req.sonnet_model,
+        req.opus_model,
+        req.default_model_family,
+    )
+
+    # 如果设为默认，先取消其他默认
+    if req.is_default:
+        _db.execute("UPDATE model_configs SET is_default = 0 WHERE user_id = ?", (user_id,))
+
+    _db.execute(
+        """INSERT INTO model_configs (
+               id, user_id, name, model, sonnet_model, opus_model, default_model_family,
+               api_key_encrypted, base_url, is_default, created_at
+           )
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            config_id,
+            user_id,
+            req.name,
+            model_fields["model"],
+            model_fields["sonnet_model"],
+            model_fields["opus_model"],
+            model_fields["default_model_family"],
+            encrypted_key,
+            req.base_url or "",
+            int(req.is_default),
+            now,
+        ),
+    )
+    _db.commit()
     return {
-        "api_key": row[0],
-        "base_url": row[1],
-        "model": row[2],
-        "created_at": row[3],
-        "updated_at": row[4],
+        "id": config_id,
+        "name": req.name,
+        "model": model_fields["model"],
+        "sonnet_model": model_fields["sonnet_model"],
+        "opus_model": model_fields["opus_model"],
+        "default_model_family": model_fields["default_model_family"],
+        "base_url": req.base_url or "",
+        "has_api_key": True,
+        "is_default": req.is_default,
+        "created_at": now,
     }
 
 
-@app.put("/api/settings/model")
-async def update_model_settings(req: ModelSettingsRequest, request: Request):
-    """更新当前用户的模型配置。"""
+@app.put("/api/model-configs/{config_id}")
+async def update_model_config(config_id: str, req: ModelConfigUpdate, request: Request):
+    """更新指定模型配置。api_key 仅在传入时覆盖。"""
     user_id = _require_user(request)
-    now = datetime.utcnow().isoformat()
-
-    # 读取现有配置
-    existing = _db.execute(
-        "SELECT api_key, base_url, model FROM model_settings WHERE user_id = ?",
-        (user_id,),
+    row = _db.execute(
+        """SELECT id, user_id, name, model, sonnet_model, opus_model, default_model_family,
+                  base_url, api_key_encrypted, is_default, created_at
+           FROM model_configs
+           WHERE id = ?""",
+        (config_id,),
     ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="配置不存在")
+    if row[1] != user_id:
+        raise HTTPException(status_code=403, detail="无权修改此配置")
 
-    api_key = req.api_key if req.api_key is not None else (existing[0] if existing else "")
-    base_url = req.base_url if req.base_url is not None else (existing[1] if existing else "")
-    model = req.model if req.model is not None else (existing[2] if existing else "")
+    model_fields = _resolve_model_config_fields(
+        req.model if req.model is not None else row[3],
+        req.sonnet_model if req.sonnet_model is not None else row[4],
+        req.opus_model if req.opus_model is not None else row[5],
+        req.default_model_family if req.default_model_family is not None else row[6],
+    )
+    encrypted_key = _encrypt_api_key(req.api_key) if req.api_key is not None else row[8]
+    is_default = bool(req.is_default) if req.is_default is not None else bool(row[9])
+    if is_default:
+        _db.execute("UPDATE model_configs SET is_default = 0 WHERE user_id = ?", (user_id,))
 
     _db.execute(
-        """INSERT INTO model_settings (user_id, api_key, base_url, model, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(user_id) DO UPDATE SET
-               api_key = excluded.api_key,
-               base_url = excluded.base_url,
-               model = excluded.model,
-               updated_at = excluded.updated_at
-        """,
-        (user_id, api_key, base_url, model, now if not existing else existing[0], now),
+        """UPDATE model_configs
+           SET name = ?, model = ?, sonnet_model = ?, opus_model = ?,
+               default_model_family = ?, api_key_encrypted = ?, base_url = ?, is_default = ?
+           WHERE id = ?""",
+        (
+            req.name if req.name is not None else row[2],
+            model_fields["model"],
+            model_fields["sonnet_model"],
+            model_fields["opus_model"],
+            model_fields["default_model_family"],
+            encrypted_key,
+            req.base_url if req.base_url is not None else row[7],
+            int(is_default),
+            config_id,
+        ),
     )
     _db.commit()
-    return {"api_key": api_key, "base_url": base_url, "model": model, "updated_at": now}
+
+    updated = _db.execute(
+        """SELECT id, name, model, sonnet_model, opus_model, default_model_family,
+                  base_url, api_key_encrypted, is_default, created_at
+           FROM model_configs
+           WHERE id = ?""",
+        (config_id,),
+    ).fetchone()
+    return _model_config_response(updated)
+
+
+@app.delete("/api/model-configs/{config_id}")
+async def delete_model_config(config_id: str, request: Request):
+    """删除指定的模型配置。"""
+    user_id = _require_user(request)
+    row = _db.execute("SELECT user_id FROM model_configs WHERE id = ?", (config_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="配置不存在")
+    if row[0] != user_id:
+        raise HTTPException(status_code=403, detail="无权删除此配置")
+    _db.execute("DELETE FROM model_configs WHERE id = ?", (config_id,))
+    _db.commit()
+    return {"ok": True}
+
+
+@app.put("/api/model-configs/{config_id}/default")
+async def set_default_config(config_id: str, request: Request):
+    """将指定配置设为默认。"""
+    user_id = _require_user(request)
+    row = _db.execute("SELECT user_id FROM model_configs WHERE id = ?", (config_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="配置不存在")
+    if row[0] != user_id:
+        raise HTTPException(status_code=403, detail="无权修改此配置")
+
+    _db.execute("UPDATE model_configs SET is_default = 0 WHERE user_id = ?", (user_id,))
+    _db.execute("UPDATE model_configs SET is_default = 1 WHERE id = ?", (config_id,))
+    _db.commit()
+    return {"ok": True}
 
 
 # ── Credits 接口 ─────────────────────────────────────────────────────────────
 
-@app.post("/api/credits/record")
-async def record_credits(req: CreditsRecordRequest, request: Request):
-    """记录一次 API 使用量。"""
-    user_id = _require_user(request)
-    now = datetime.utcnow().isoformat()
-
-    # 读取现有 credits
-    existing = _db.execute(
-        "SELECT cache_hit_input, cache_miss_input, output, total_used FROM credits WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()
-
-    cache_hit = (existing[0] if existing else 0) + req.cache_hit_input
-    cache_miss = (existing[1] if existing else 0) + req.cache_miss_input
-    output = (existing[2] if existing else 0) + req.output_tokens
-    total = cache_hit + cache_miss + output
-
-    _db.execute(
-        """INSERT INTO credits (user_id, cache_hit_input, cache_miss_input, output, total_used, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(user_id) DO UPDATE SET
-               cache_hit_input = excluded.cache_hit_input,
-               cache_miss_input = excluded.cache_miss_input,
-               output = excluded.output,
-               total_used = excluded.total_used,
-               updated_at = excluded.updated_at
-        """,
-        (user_id, cache_hit, cache_miss, output, total, now),
-    )
-    _db.commit()
-    return {
-        "cache_hit_input": cache_hit,
-        "cache_miss_input": cache_miss,
-        "output": output,
-        "total_used": total,
-    }
-
-
 @app.get("/api/credits")
 async def get_credits(request: Request):
-    """查询用户 Credits 余额。"""
+    """获取当前用户总消耗（聚合查询）。"""
     user_id = _require_user(request)
     row = _db.execute(
-        "SELECT cache_hit_input, cache_miss_input, output, total_used, updated_at FROM credits WHERE user_id = ?",
+        """SELECT COALESCE(SUM(cache_hit_input), 0), COALESCE(SUM(cache_miss_input), 0),
+                  COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cost_usd), 0)
+           FROM credits_log WHERE user_id = ?""",
         (user_id,),
     ).fetchone()
-    if row is None:
-        return {
-            "cache_hit_input": 0,
-            "cache_miss_input": 0,
-            "output": 0,
-            "total_used": 0,
-            "updated_at": "",
-        }
     return {
-        "cache_hit_input": row[0],
-        "cache_miss_input": row[1],
-        "output": row[2],
-        "total_used": row[3],
-        "updated_at": row[4],
+        "cache_hit_input": row[0] or 0,
+        "cache_miss_input": row[1] or 0,
+        "output": row[2] or 0,
+        "total_cost_usd": row[3] or 0.0,
     }
+
+
+@app.get("/api/credits/logs")
+async def get_credits_logs(request: Request, limit: int = 50, offset: int = 0):
+    """获取消耗明细。"""
+    user_id = _require_user(request)
+    rows = _db.execute(
+        """SELECT id, task_id, cache_hit_input, cache_miss_input, output_tokens, cost_usd, model, created_at
+           FROM credits_log WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+        (user_id, limit, offset),
+    ).fetchall()
+    return [
+        {
+            "id": r[0],
+            "task_id": r[1],
+            "cache_hit_input": r[2],
+            "cache_miss_input": r[3],
+            "output_tokens": r[4],
+            "cost_usd": r[5],
+            "model": r[6] or "",
+            "created_at": r[7],
+        }
+        for r in rows
+    ]
 
 
 @app.post("/api/tasks", response_model=Task, response_model_exclude={"workspace_path"})
@@ -1808,12 +2113,16 @@ async def create_task(req: CreateTaskRequest, request: Request):
     workspace_path = str(_resolve_workspace_path(browse_node_id))
     meta = _load_analysis_meta(workspace_path)
     saved_session_id = meta.get("session_id") if isinstance(meta.get("session_id"), str) else None
+    task_model = (req.model or "").strip() or None
+    if task_model is None and req.model_family:
+        _normalize_model_family(req.model_family)
+        task_model = _select_config_model(_load_default_model_config(user_id), req.model_family) or None
 
     task = Task(
         id=task_id,
         url=req.url,
         browse_node_id=browse_node_id,
-        model=req.model,
+        model=task_model,
         session_id=saved_session_id.strip() if saved_session_id and saved_session_id.strip() else None,
         status=TaskStatus.PENDING,
         created_at=now,
@@ -2093,11 +2402,14 @@ async def chat_with_task(task_id: str, req: ChatRequest):
         f"分析报告存储在 {task.workspace_path}]\n\n"
         f"{req.message}"
     )
+    cli_config = _build_claude_cli_config(task.owner_id, explicit_model=task.model)
 
     def _build_chat_cmd(session_id: Optional[str]) -> list[str]:
         cmd = ["claude"]
         if session_id:
             cmd.extend(["--resume", session_id])
+        elif cli_config["model"]:
+            cmd.extend(["--model", cli_config["model"]])
         cmd.extend([
             "-p", context,
             "--plugin-dir", PLUGIN_DIR,
@@ -2140,7 +2452,7 @@ async def chat_with_task(task_id: str, req: ChatRequest):
             while True:
                 cmd = _build_chat_cmd(task.session_id)
                 try:
-                    proc = _spawn_process(cmd)
+                    proc = _spawn_process(cmd, env_extra=cli_config["env"] or None)
                     _session_not_found = False
                     if proc.stdout is not None:
                         while True:
@@ -2165,8 +2477,13 @@ async def chat_with_task(task_id: str, req: ChatRequest):
                     if _session_not_found and task.session_id and not _chat_retried:
                         try:
                             proc.kill()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            LOGGER.error(
+                                "聊天进程终止失败，task_id=%s，exception_type=%s",
+                                task_id,
+                                type(exc).__name__,
+                                exc_info=True,
+                            )
                         task.session_id = None
                         _update_task(task_id, session_id=None)
                         _save_analysis_meta(task.workspace_path, {"session_id": ""})
@@ -2177,9 +2494,21 @@ async def chat_with_task(task_id: str, req: ChatRequest):
                     if _assistant_text_buf:
                         _save_chat_message(task_id, "assistant", "".join(_assistant_text_buf))
                     yield f"data: {json.dumps({'done': True})}\n\n"
-                except FileNotFoundError:
+                except FileNotFoundError as exc:
+                    LOGGER.error(
+                        "claude CLI 不存在，task_id=%s，exception_type=%s",
+                        task_id,
+                        type(exc).__name__,
+                        exc_info=True,
+                    )
                     yield f"data: {json.dumps({'error': 'claude CLI not found'})}\n\n"
                 except Exception as e:
+                    LOGGER.error(
+                        "聊天请求失败，task_id=%s，exception_type=%s",
+                        task_id,
+                        type(e).__name__,
+                        exc_info=True,
+                    )
                     yield f"data: {json.dumps({'error': str(e)})}\n\n"
                 break  # done (retry uses continue)
         finally:

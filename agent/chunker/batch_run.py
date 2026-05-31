@@ -98,7 +98,10 @@ def discover_asins(products_dir: Path) -> list[str]:
 
 def _chunk_product(asin: str, products_dir: Path, product_out_dir: Path) -> dict:
     """Run static chunker on one ASIN. Returns blocks status dict."""
-    from chunker.static_chunker import chunk_product_html, write_product_manifest
+    try:
+        from chunker.static_chunker import chunk_product_html, write_product_manifest
+    except ImportError as e:
+        return {"chunk_status": "FAILED", "reason": f"chunker_module_not_available: {e}"}
 
     html_path = products_dir / asin / "product.html"
     result = chunk_product_html(html_path, product_out_dir)

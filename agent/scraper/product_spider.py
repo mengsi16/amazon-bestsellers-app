@@ -316,6 +316,22 @@ class ProductSpider:
 
             scroll_pause_ms = max(400, self.config.wait_ms // 3)
 
+            # ── Connection warm-up ──────────────────────────────────────────
+            # First TCP+TLS handshake to Amazon can take 30-60s on some networks.
+            # Warm up the connection pool before launching the concurrent crawl so
+            # subsequent requests don't stall on DNS/TCP.
+            if to_crawl:
+                warm_url = to_crawl[0]["canonical_url"]
+                LOGGER.info("[Warmup] Pre-fetching %s to warm connection pool …", warm_url)
+                try:
+                    warm_fetch_kwargs = dict(fetch_kwargs)
+                    warm_fetch_kwargs["timeout"] = 20000  # 20s is enough for warm-up
+                    warm_fetch_kwargs["page_action"] = None  # skip automation, just fetch; no HTML write
+                    await session.fetch(warm_url, **warm_fetch_kwargs)
+                    LOGGER.info("[Warmup] Connection pool warmed — proceeding with crawl.")
+                except Exception as exc:
+                    LOGGER.warning("[Warmup] Warm-up request failed (ignored): %s", exc)
+
             async def _bypass_captcha(page) -> bool:
                 """Amazon 'Continue shopping' captcha 自动通过。返回是否触发过 bypass。"""
                 form = await page.query_selector('form[action*="validateCaptcha"]')
@@ -761,8 +777,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     stealth_group.add_argument("--prefer-stealth", dest="prefer_stealth", action="store_true", default=True)
     stealth_group.add_argument("--no-prefer-stealth", dest="prefer_stealth", action="store_false")
 
-    parser.add_argument("--solve-cloudflare", action="store_true", default=True)
-    parser.add_argument("--no-solve-cloudflare", dest="solve_cloudflare", action="store_false")
+    parser.add_argument("--solve-cloudflare", action="store_false", default=False)
+    parser.add_argument("--no-solve-cloudflare", dest="solve_cloudflare", action="store_true")
     parser.add_argument("--useragent", default=None)
     parser.add_argument("--proxy", default=None)
     parser.add_argument("--force", action="store_true",

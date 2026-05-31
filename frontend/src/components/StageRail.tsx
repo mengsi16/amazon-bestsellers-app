@@ -35,10 +35,8 @@ function stageStatus(
   task: Task | null,
 ): 'done' | 'active' | 'pending' | 'locked' {
   if (getPhase(phases, key)) return 'done'
-  // qa is always "locked" until summary done
   if (key === 'qa' && !phases.summary) return 'locked'
 
-  // First non-done pipeline stage is the active one (only when task is running)
   if (task?.status === 'running') {
     for (const k of ['crawl', 'chunk', 'analyze', 'summary']) {
       if (!getPhase(phases, k)) {
@@ -50,10 +48,14 @@ function stageStatus(
 }
 
 function StatusIcon({ status }: { status: 'done' | 'active' | 'pending' | 'locked' }) {
-  if (status === 'done') return <CheckCircle2 size={18} className="text-emerald-400" />
-  if (status === 'active') return <Loader2 size={18} className="text-indigo-400 animate-spin" />
-  if (status === 'locked') return <Lock size={14} className="text-slate-700" />
-  return <Circle size={18} className="text-slate-700" />
+  if (status === 'done') return <CheckCircle2 size={15} className="text-[var(--success)]" />
+  if (status === 'active') return (
+    <div className="relative">
+      <Loader2 size={15} className="text-[var(--accent)] animate-spin" />
+    </div>
+  )
+  if (status === 'locked') return <Lock size={12} className="text-[var(--text-disabled)]" />
+  return <Circle size={15} className="text-[var(--text-disabled)]" />
 }
 
 export default function StageRail({ task, phases, catalog, currentItem }: Props) {
@@ -63,30 +65,30 @@ export default function StageRail({ task, phases, catalog, currentItem }: Props)
   const pct = Math.round((doneCount / 4) * 100)
 
   return (
-    <aside className="shrink-0 w-72 border-l border-slate-800 bg-[#0b0e15] flex flex-col">
-      <div className="p-4 border-b border-slate-800">
-        <h2 className="text-sm font-semibold text-white">流水线进度</h2>
-        <div className="mt-3 flex items-center gap-2">
-          <div className="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+    <aside className="shrink-0 w-64 border-l border-[var(--border-default)] bg-[var(--bg-raised)] flex flex-col">
+      <div className="px-4 py-3.5 border-b border-[var(--border-default)]">
+        <h2 className="text-sm font-medium text-[var(--text-primary)]">流水线进度</h2>
+        <div className="mt-3 flex items-center gap-2.5">
+          <div className="flex-1 h-1.5 bg-[var(--bg-overlay)] rounded-full overflow-hidden">
             <div
-              className={`h-full rounded-full transition-all duration-500 ${
+              className={`h-full rounded-full transition-all duration-500 ease-out ${
                 task?.status === 'failed'
-                  ? 'bg-red-500'
+                  ? 'bg-[var(--error)]'
                   : phases.summary
-                  ? 'bg-emerald-500'
-                  : 'bg-indigo-500'
+                  ? 'bg-[var(--success)]'
+                  : 'bg-[var(--accent)]'
               }`}
               style={{ width: `${pct}%` }}
             />
           </div>
-          <span className="text-xs text-slate-400 tabular-nums">{pct}%</span>
+          <span className="text-xs text-[var(--text-tertiary)] tabular-nums font-medium min-w-[28px] text-right">{pct}%</span>
         </div>
-        <p className="text-xs text-slate-500 mt-1.5">
+        <p className="text-[11px] text-[var(--text-disabled)] mt-1.5">
           {doneCount} / 4 阶段完成
         </p>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-3 space-y-2">
+      <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
         {stages.map((s, idx) => {
           const st = stageStatus(s.key, phases, task)
           const isActive = st === 'active'
@@ -95,14 +97,14 @@ export default function StageRail({ task, phases, catalog, currentItem }: Props)
           return (
             <div
               key={s.key}
-              className={`relative rounded-lg border transition-colors ${
+              className={`relative rounded-[var(--radius-sm)] border transition-all duration-150 ${
                 isDone
-                  ? 'border-emerald-900/40 bg-emerald-950/20'
+                  ? 'border-transparent bg-transparent'
                   : isActive
-                  ? 'border-indigo-700/60 bg-indigo-950/40 ring-1 ring-indigo-600/30'
+                  ? 'border-[var(--border-default)] bg-[var(--bg-base)]'
                   : isLocked
-                  ? 'border-slate-800 bg-slate-900/30 opacity-60'
-                  : 'border-slate-800 bg-slate-900/30'
+                  ? 'border-transparent bg-transparent opacity-50'
+                  : 'border-transparent bg-transparent hover:bg-[var(--bg-base)]'
               }`}
             >
               <div className="flex items-start gap-2.5 p-3">
@@ -111,25 +113,27 @@ export default function StageRail({ task, phases, catalog, currentItem }: Props)
                 </div>
                 <div className="min-w-0 flex-1">
                   <p
-                    className={`text-sm font-medium leading-snug ${
+                    className={`text-xs font-medium leading-snug ${
                       isDone
-                        ? 'text-emerald-300'
+                        ? 'text-[var(--success)]'
                         : isActive
-                        ? 'text-indigo-200'
-                        : 'text-slate-400'
+                        ? 'text-[var(--accent)]'
+                        : isLocked
+                        ? 'text-[var(--text-disabled)]'
+                        : 'text-[var(--text-secondary)]'
                     }`}
                   >
                     {s.label}
                   </p>
-                  <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                  <p className="text-[10px] text-[var(--text-disabled)] mt-0.5 leading-relaxed">
                     {STAGE_DESC[s.key] || ''}
                   </p>
                   {isActive && currentItem && (
-                    <div className="mt-2 text-xs text-indigo-300/80 truncate">
-                      <span className="text-slate-500">当前：</span>
+                    <div className="mt-1.5 text-[10px] text-[var(--accent)] truncate bg-[var(--accent-muted)] rounded-[var(--radius-xs)] px-1.5 py-1">
+                      <span className="opacity-60">当前：</span>
                       {currentItem.meta?.last_activity
                         || currentItem.meta?.input_summary
-                        || currentItem.content.slice(0, 60)
+                        || currentItem.content.slice(0, 50)
                         || '…'}
                     </div>
                   )}
@@ -138,8 +142,8 @@ export default function StageRail({ task, phases, catalog, currentItem }: Props)
 
               {idx < stages.length - 1 && (
                 <div
-                  className={`absolute left-[21px] -bottom-2 w-px h-2 ${
-                    isDone ? 'bg-emerald-800' : 'bg-slate-800'
+                  className={`absolute left-[18px] -bottom-1.5 w-px h-1.5 ${
+                    isDone ? 'bg-[var(--success)]/40' : 'bg-[var(--border-default)]'
                   }`}
                 />
               )}
@@ -148,10 +152,10 @@ export default function StageRail({ task, phases, catalog, currentItem }: Props)
         })}
       </div>
 
-      <div className="border-t border-slate-800 p-3 text-[11px] text-slate-600 leading-relaxed">
-        <p>• 流水线单次运行约 30–90 分钟。</p>
-        <p>• chunks 已存在时会自动跳过重复 chunker。</p>
-        <p>• 中途不会停下来问你，summary.md 写出才算完成。</p>
+      <div className="border-t border-[var(--border-default)] p-3 text-[10px] text-[var(--text-disabled)] leading-relaxed space-y-1">
+        <p>• 流水线单次运行约 30–90 分钟</p>
+        <p>• chunks 已存在时会自动跳过重复 chunker</p>
+        <p>• 中途不会停下来问你，summary.md 写出才算完成</p>
       </div>
     </aside>
   )

@@ -287,15 +287,15 @@ crawl_bestseller_list(
 crawl_product_details(
     product_urls = [Step 2a 返回的全部商品 URL],
     output_dir = "{workspace}",          ← workspace 根目录绝对路径！
-    auto_extract_images = True,           ← 默认开启：爬完自动提取 listing + A+ 图
+    auto_extract_images = False,          ← 关闭：串联提取 listing + A+ 图极慢（50ASIN×2提取≈15-30min），会导致 2 小时超时。先只爬 HTML，后续步骤并行提取。
     max_concurrency = 3
 )
 ```
 
 **工具行为**：
 - **ASIN 去重**：工具会自动跳过 `{workspace}/products/{ASIN}/product.html` 已存在且有效的 ASIN
-- **自动图片提取**：爬完每个 ASIN 后自动串联运行 listing 图 + A+ 图的提取与下载
-- **输出位置**：每个 ASIN 的全部产物落在 `{workspace}/products/{ASIN}/` 下
+- **图片提取**：关闭了 `auto_extract_images`，只爬 HTML 不串联提取。图片提取在 Step 3.5 之后与 analyst 并行进行，不阻塞主流程
+- **输出位置**：每个 ASIN 的 `product.html` 落在 `{workspace}/products/{ASIN}/` 下
 
 **调用后：什么都不要做，等工具返回。** 这个工具要爬取 50 个商品详情页（每个 2MB），每个页面还要解析 listing / A+ 图并下载，整个过程可能需要 30 分钟到 1 小时以上。工具在后台执行，完成后会返回结果。在工具返回之前：
 - ❌ 不要检查文件目录
@@ -306,9 +306,8 @@ crawl_product_details(
 - ✅ 唯一该做的事：等待
 
 **Step 2b 检查点**（仅在工具返回后检查）：
-- 确认 `{workspace}/products/` 下有按 ASIN 命名的子目录，每个下有 `product.html`
-- 检查 `extraction_results`：大多数 ASIN 的 `listing` 和 `aplus` 应返回 `status: OK` 或 `ALREADY_DONE`
-- 如果工具返回报错或部分失败：记录失败信息，带着已成功的文件继续进入 Step 3，不要重试
+- 确认 `{workspace}/products/` 下有按 ASIN 命名的子目录，每个下有 `product.html`（> 500KB 为有效）
+- 跳过失败的 ASIN，带着已成功的文件继续进入 Step 3，不要重试
 
 **Step 2b 通过后 → 进入 Step 3。**
 
@@ -564,7 +563,7 @@ category_slug = browse_node_id：{browse_node_id}
 4. **顺序执行**：scraper → chunker → **audit** → analysts → summary，不可跳步。
 5. **scraper MCP 工具每种只调用 1 次**：`crawl_bestseller_list` 只调用 1 次，`crawl_product_details` 只调用 1 次。工具是阻塞式的，调用后等它返回即可，不需要自己轮询文件。即使返回报错也不重试，记录错误后继续。
 6. **禁止回退重跑**：任何已经调用过的 scraper 工具，不得再次调用。Step 2a 完成后不得回退到 Step 2a，Step 2b 完成后不得回退到 Step 2a 或 Step 2b。流水线只能向前推进。
-7. **不需要再单独下载图片**：listing 图和 A+ 图由 `crawl_product_details` 在 `auto_extract_images=True` 时自动提取到 `{workspace}/products/{ASIN}/` 下。analyst 只需读取现成结果，**不要再调用 `extract_listing_images` / `extract_aplus_images` MCP 工具**，除非某个 ASIN 的提取失败需要补跑。
+7. **图片按需单独提取**：`crawl_product_details` 默认关闭 `auto_extract_images`（串联提取太慢会撑爆 2 小时超时）。analyst 需要图片时，调用 MCP `extract_listing_images` / `extract_aplus_images` 工具补跑。建议并行提取多个 ASIN，不要逐个串行调用。
 8. **checklist 不得驱动重刷**：Exit Checklist 未勾选时，绝不回退重爬；只能向前推进到下一个未完成的步骤。
 9. **检查点验证**：每个步骤的**工具返回后**检查产出文件是否存在。Step 2a 完成后检查 `rankings.jsonl`，Step 2b 完成后检查 `products/{ASIN}/product.html`。检查点失败时报错记录，但绝不回退重跑已完成的 Phase。
 10. **子 agent 触发必须传 workspace + browse_node_id**：触发任何子 agent 时，提示词中必须明确包含 `workspace 绝对路径：{workspace}` 和 `browse_node_id：{browse_node_id}`。
@@ -670,7 +669,7 @@ crawl_bestseller_list(
 crawl_product_details(
     product_urls = [新增 ASIN 的 canonical URL 列表],
     output_dir = "{workspace}",
-    auto_extract_images = True,
+    auto_extract_images = False,
     max_concurrency = 3
 )
 ```

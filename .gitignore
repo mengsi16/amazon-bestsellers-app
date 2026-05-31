@@ -1,6 +1,29 @@
-__pycache__/
+﻿__pycache__/
 .vscode/
 .venv/
 node_modules/
 workspace/
 .claude/
+
+# local env and secrets
+.env
+
+# local docs/work notes
+md/
+
+# local browser artifacts
+.playwright-cli/
+.playwright-mcp/
+test-results/
+
+# logs
+*.log
+*.err
+*.out
+
+# local databases/runtime state
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+backend/tasks.json
+backend/tasks.json.bak

@@ -16,17 +16,17 @@ interface Props {
 }
 
 const iconMap = {
-  error: <AlertCircle size={16} className="text-red-400 shrink-0" />,
-  success: <CheckCircle size={16} className="text-emerald-400 shrink-0" />,
-  warning: <AlertTriangle size={16} className="text-amber-400 shrink-0" />,
-  info: <Info size={16} className="text-blue-400 shrink-0" />,
+  error: <AlertCircle size={16} className="text-[var(--error)] shrink-0" />,
+  success: <CheckCircle size={16} className="text-[var(--success)] shrink-0" />,
+  warning: <AlertTriangle size={16} className="text-[var(--warning)] shrink-0" />,
+  info: <Info size={16} className="text-[var(--accent)] shrink-0" />,
 }
 
 const bgMap = {
-  error: 'border-red-800/60 bg-red-950/80',
-  success: 'border-emerald-800/60 bg-emerald-950/80',
-  warning: 'border-amber-800/60 bg-amber-950/80',
-  info: 'border-blue-800/60 bg-blue-950/80',
+  error: 'border-[var(--error)]/25 bg-[var(--bg-raised)]',
+  success: 'border-[var(--success)]/25 bg-[var(--bg-raised)]',
+  warning: 'border-[var(--warning)]/25 bg-[var(--bg-raised)]',
+  info: 'border-[var(--accent)]/25 bg-[var(--bg-raised)]',
 }
 
 function ToastItemView({ toast, onDismiss }: { toast: ToastItem; onDismiss: (id: string) => void }) {
@@ -42,13 +42,13 @@ function ToastItemView({ toast, onDismiss }: { toast: ToastItem; onDismiss: (id:
 
   return (
     <div
-      className={`flex items-start gap-3 px-4 py-3 rounded-xl border shadow-lg backdrop-blur-sm ${bgMap[toast.type]} animate-slide-in`}
+      className={`flex items-start gap-3 px-4 py-3 rounded-[var(--radius-md)] border shadow-sm ${bgMap[toast.type]} animate-slide-in`}
     >
       <div className="mt-0.5">{iconMap[toast.type]}</div>
-      <p className="text-sm text-slate-200 flex-1 min-w-0 break-words">{toast.message}</p>
+      <p className="text-sm text-[var(--text-primary)] flex-1 min-w-0 break-words">{toast.message}</p>
       <button
         onClick={() => onDismiss(toast.id)}
-        className="text-slate-500 hover:text-slate-300 cursor-pointer shrink-0 mt-0.5"
+        className="text-[var(--text-tertiary)] hover:text-[var(--text-primary)] cursor-pointer shrink-0 mt-0.5"
       >
         <X size={14} />
       </button>

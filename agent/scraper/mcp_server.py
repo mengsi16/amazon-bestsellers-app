@@ -209,7 +209,7 @@ async def crawl_product_details(
     headless: bool = True,
     solve_cloudflare: bool = False,
     proxy: str | None = None,
-    auto_extract_images: bool = True,
+    auto_extract_images: bool = False,
     force: bool = False,
     max_rounds: int = 3,
     inter_round_delay_s: float = 30.0,

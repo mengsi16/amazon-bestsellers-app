@@ -14,10 +14,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
     && apt-get install -y nodejs \
     && npm install -g npm@latest
 
-# 安装 Claude Code CLI（固定版本）
+# 安装 Claude Code CLI（固定版本 1.0.0）
 # https://docs.anthropic.com/en/docs/claude-code/setup
-# 推荐版本：v1.0.0+
-ARG CLAUDE_VERSION=1.0.45
+ARG CLAUDE_VERSION=1.0.0
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_VERSION}
 
 # 验证 Claude Code 安装

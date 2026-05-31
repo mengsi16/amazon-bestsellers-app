@@ -4,31 +4,31 @@
 :root {
   /* 背景层次 */
   --bg-deepest: #ffffff;
-  --bg-deep: #f4f5f7;
-  --bg-base: #fafbfc;
+  --bg-deep: #edf3f6;
+  --bg-base: #f7f8f9;
   --bg-raised: #ffffff;
-  --bg-overlay: #f0f1f3;
-  --bg-surface: #e8eaed;
+  --bg-overlay: #f1f3f4;
+  --bg-surface: #e6eaee;
   --bg-elevated: #ffffff;
 
   /* 边框层次 */
   --border-subtle: rgba(0, 0, 0, 0.04);
-  --border-default: #e4e7eb;
-  --border-emphasis: #d0d7de;
+  --border-default: #dfe4e8;
+  --border-emphasis: #cfd6dc;
   --border-strong: #b1bac4;
 
   /* 文字层次 */
-  --text-primary: #1a1a1a;
-  --text-secondary: #4b5563;
-  --text-tertiary: #9ca3af;
-  --text-disabled: #d1d5db;
+  --text-primary: #202124;
+  --text-secondary: #5f6368;
+  --text-tertiary: #8a9099;
+  --text-disabled: #b7bec7;
 
   /* 主色调：科技蓝 */
-  --accent: #3b82f6;
-  --accent-hover: #60a5fa;
-  --accent-muted: rgba(59, 130, 246, 0.08);
-  --accent-glow: rgba(59, 130, 246, 0.15);
-  --accent-emphasis: #1d4ed8;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-muted: rgba(37, 99, 235, 0.08);
+  --accent-glow: rgba(37, 99, 235, 0.14);
+  --accent-emphasis: #1e40af;
 
   /* 语义色 */
   --success: #22c55e;
@@ -41,9 +41,9 @@
   /* 圆角 */
   --radius-xs: 4px;
   --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
-  --radius-xl: 18px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
 
   /* 过渡曲线 */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
@@ -56,12 +56,12 @@
 
 body {
   margin: 0;
-  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-family: system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   background: var(--bg-deep);
   color: var(--text-primary);
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
   line-height: 1.6;
 }
 
@@ -92,14 +92,14 @@ body {
   color: var(--text-secondary);
   line-height: 1.75;
   font-size: 0.875rem;
-  letter-spacing: -0.005em;
+  letter-spacing: 0;
 }
 .prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 {
   color: var(--text-primary);
   font-weight: 600;
   margin: 1.5em 0 0.5em;
   line-height: 1.3;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
 }
 .prose h1 { font-size: 1.4rem; }
 .prose h2 {
@@ -238,3 +238,38 @@ body {
 .delay-200 { animation-delay: 0.2s; }
 .delay-300 { animation-delay: 0.3s; }
 .delay-400 { animation-delay: 0.4s; }
+
+@media (max-width: 760px) {
+  .app-shell {
+    flex-direction: column;
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
+  .app-sidebar {
+    width: 100%;
+    height: auto;
+    position: relative;
+    overflow: visible;
+    border-right: none;
+    border-bottom: 1px solid var(--border-default);
+  }
+
+  .app-main-panel {
+    width: 100%;
+    min-height: 54vh;
+    height: auto;
+    overflow: visible;
+  }
+
+  .stage-rail-shell {
+    width: 100%;
+  }
+
+  .stage-rail-shell > aside {
+    width: 100%;
+    border-left: none;
+    border-top: 1px solid var(--border-default);
+  }
+}
