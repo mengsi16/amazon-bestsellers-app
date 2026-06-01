@@ -21,3 +21,4 @@
 | 19 | pending | 设计并实现用户自定义分析专家 Agent 配置 | 先审查 orchestrator 调度和 agent 契约；只允许用户配置分析类 agent，不动爬虫、分块、清洗和 audit |
 | 20 | pending | 拆分 backend/main.py 的认证、任务、模型配置和进度模块 | 先写模块边界计划；拆分后接口行为、SQLite schema 初始化、SSE 与任务状态回归测试保持通过 |
 | 21 | finished | 修复刷新按钮卡在刷新中 | 已完成任务的刷新按钮不受其他任务运行态影响；刷新完成后即使 SSE 完成回调丢失，也能通过任务轮询恢复为刷新排名；前端构建、后端 API 测试和浏览器验证通过 |
+| 22 | finished | 补充项目根 Apache-2.0 协议并推送远端 | 新增根目录 LICENSE 与执行计划文档；根 package.json、package-lock.json、README 已声明 Apache-2.0；提交并推送到 tlh/main |

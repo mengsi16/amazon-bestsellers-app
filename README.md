@@ -136,6 +136,10 @@ npm run build
 
 该脚本默认保留为本地排查工具，使用前按实际 `browse_node_id` 修改 workspace 路径。
 
+## License
+
+本项目采用 Apache License 2.0，详见 `LICENSE`。
+
 ## Credits
 
 | 项目 | 地址 |
