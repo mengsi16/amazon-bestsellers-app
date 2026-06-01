@@ -22,3 +22,4 @@
 | 20 | pending | 拆分 backend/main.py 的认证、任务、模型配置和进度模块 | 先写模块边界计划；拆分后接口行为、SQLite schema 初始化、SSE 与任务状态回归测试保持通过 |
 | 21 | finished | 修复刷新按钮卡在刷新中 | 已完成任务的刷新按钮不受其他任务运行态影响；刷新完成后即使 SSE 完成回调丢失，也能通过任务轮询恢复为刷新排名；前端构建、后端 API 测试和浏览器验证通过 |
 | 22 | finished | 补充项目根 Apache-2.0 协议并推送远端 | 新增根目录 LICENSE 与执行计划文档；根 package.json、package-lock.json、README 已声明 Apache-2.0；提交并推送到 tlh/main |
+| 23 | finished | 模仿 agent README 风格改造 App README 并推送远端 | 重写根 README 并新增 README_en.md；已包含中英文选择、居中关键词链接、项目简介、项目架构、部署方式和 Claude Code 致谢；提交并推送到 tlh/main |
