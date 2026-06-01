@@ -25,5 +25,10 @@ md/
 backend/*.db
 backend/*.db-shm
 backend/*.db-wal
+backend/*.db-journal
+backend/*.db.bak*
 backend/tasks.json
 backend/tasks.json.bak
+
+# local temporary files
+tmp/
