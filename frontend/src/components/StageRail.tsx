@@ -65,7 +65,7 @@ export default function StageRail({ task, phases, catalog, currentItem }: Props)
   const pct = Math.round((doneCount / 4) * 100)
 
   return (
-    <aside className="shrink-0 w-64 border-l border-[var(--border-default)] bg-[var(--bg-raised)] flex flex-col">
+    <aside className="h-full w-full shrink-0 border-l border-[var(--border-default)] bg-[var(--bg-raised)] flex flex-col">
       <div className="px-4 py-3.5 border-b border-[var(--border-default)]">
         <h2 className="text-sm font-medium text-[var(--text-primary)]">流水线进度</h2>
         <div className="mt-3 flex items-center gap-2.5">

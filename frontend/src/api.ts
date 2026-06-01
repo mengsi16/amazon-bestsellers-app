@@ -152,18 +152,62 @@ function authHeaders(): Record<string, string> {
 export interface AuthResponse {
   user_id: string
   username: string
+  email?: string
+  email_verified?: boolean
+  created_at?: string
   token: string
 }
 
 export interface UserInfo {
   user_id: string
   username: string
+  email?: string
+  email_verified?: boolean
+  providers?: string[]
   created_at: string
+}
+
+export interface EmailCodeResponse {
+  ok: boolean
+  expires_at: string
+  dev_code?: string
 }
 
 export const api = {
   // ── 认证接口 ────────────────────────────────────────────────────────────
   async register(username: string, password: string): Promise<AuthResponse> {
+    return this.emailRegister(username, password, '')
+  },
+
+  async sendEmailCode(email: string, purpose: 'register' | 'login' = 'register'): Promise<EmailCodeResponse> {
+    const res = await fetch(`${BASE}/auth/email/send-code`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, purpose }),
+    })
+    if (!res.ok) {
+      const err = await res.json() as { detail?: string }
+      throw new Error(err.detail || '验证码发送失败')
+    }
+    return res.json()
+  },
+
+  async emailRegister(email: string, password: string, code: string): Promise<AuthResponse> {
+    const res = await fetch(`${BASE}/auth/email/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, code }),
+    })
+    if (!res.ok) {
+      const err = await res.json()
+      throw new Error(err.detail || '注册失败')
+    }
+    const data: AuthResponse = await res.json()
+    setToken(data.token)
+    return data
+  },
+
+  async legacyRegister(username: string, password: string): Promise<AuthResponse> {
     const res = await fetch(`${BASE}/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -179,14 +223,32 @@ export const api = {
   },
 
   async login(username: string, password: string): Promise<AuthResponse> {
+    return this.emailLogin(username, password)
+  },
+
+  async emailLogin(email: string, password: string): Promise<AuthResponse> {
+    const res = await fetch(`${BASE}/auth/email/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    })
+    if (!res.ok) {
+      const err = await res.json() as { detail?: string }
+      throw new Error(err.detail || '邮箱或密码错误')
+    }
+    const data: AuthResponse = await res.json()
+    setToken(data.token)
+    return data
+  },
+
+  async legacyLogin(username: string, password: string): Promise<AuthResponse> {
     const res = await fetch(`${BASE}/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     })
     if (!res.ok) {
-      let err: Record<string, unknown> = {}
-      try { err = await res.json() } catch {}
+      const err = await res.json() as { detail?: string }
       throw new Error(err.detail || '用户名或密码错误')
     }
     const data: AuthResponse = await res.json()

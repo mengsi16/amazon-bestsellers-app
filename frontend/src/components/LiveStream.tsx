@@ -1,26 +1,23 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
-  Send, Loader2, ChevronDown, ChevronRight,
-  Wrench, Cpu, CheckCircle2, XCircle, AlertTriangle, Info,
+  ArrowUp, Loader2, ChevronDown, ChevronRight, ChevronUp,
+  Wrench, Cpu, CheckCircle2, XCircle, AlertTriangle, Info, Settings2,
 } from 'lucide-react'
-import type { StreamItem, Task } from '../api'
-
-export interface LocalMessage {
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-  streaming?: boolean
-}
+import type { ModelConfig, StreamItem, Task } from '../api'
+import type { TimelineEntry } from '../timeline'
 
 interface Props {
-  items: StreamItem[]
-  localMessages: LocalMessage[]
+  timelineEntries: TimelineEntry[]
   onSend: (text: string) => void
   canAsk: boolean
   isTaskRunning: boolean
   task: Task | null
+  modelConfigs: ModelConfig[]
+  selectedModelConfigId: string | null
+  onModelConfigChange: (id: string) => void
+  onOpenSettings?: () => void
 }
 
 function SystemNote({ content }: { content: string }) {
@@ -37,9 +34,8 @@ function SystemNote({ content }: { content: string }) {
 function AssistantText({ content, streaming }: { content: string; streaming: boolean }) {
   if (!content && !streaming) return null
   return (
-    <div className="flex gap-3">
-      <div className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--text-tertiary)]" />
-      <div className="flex-1 min-w-0 max-w-[calc(100%-1rem)]">
+    <div className="mx-auto w-full max-w-3xl">
+      <div className="min-w-0">
         <div className="prose prose-sm max-w-none text-[var(--text-secondary)] leading-relaxed">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>
             {content || '▍'}
@@ -57,7 +53,7 @@ function Thinking({ content, streaming }: { content: string; streaming: boolean 
   const [open, setOpen] = useState(false)
   if (!content.trim() && !streaming) return null
   return (
-    <div className="ml-10 my-1">
+    <div className="mx-auto my-1 w-full max-w-3xl">
       <button
         onClick={() => setOpen((v) => !v)}
         className="flex items-center gap-1.5 text-xs text-[var(--text-disabled)] hover:text-[var(--text-tertiary)] cursor-pointer"
@@ -98,7 +94,7 @@ function ToolCall({ item }: { item: StreamItem }) {
   const activities = meta.subagent_activities || []
 
   return (
-    <div className="ml-10 my-1">
+    <div className="mx-auto my-1 w-full max-w-3xl">
       <div
         className={`rounded-[var(--radius-md)] border ${
           isSub
@@ -241,26 +237,31 @@ function UserBubble({ content }: { content: string }) {
 }
 
 export default function LiveStream({
-  items,
-  localMessages,
+  timelineEntries,
   onSend,
   canAsk,
   isTaskRunning,
   task,
+  modelConfigs,
+  selectedModelConfigId,
+  onModelConfigChange,
+  onOpenSettings,
 }: Props) {
   const [input, setInput] = useState('')
   const [autoScroll, setAutoScroll] = useState(true)
+  const [configMenuOpen, setConfigMenuOpen] = useState(false)
+  const [configMenuStyle, setConfigMenuStyle] = useState<CSSProperties>({})
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
-
-  const sseItems = items
+  const composerRef = useRef<HTMLDivElement>(null)
+  const configButtonRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
     if (autoScroll) {
       bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
     }
-  }, [sseItems.length, localMessages, autoScroll])
+  }, [timelineEntries, autoScroll])
 
   const handleScroll = () => {
     const el = scrollRef.current
@@ -293,15 +294,42 @@ export default function LiveStream({
     }
   }
 
-  const isEmpty = sseItems.length === 0 && localMessages.length === 0
+  const toggleConfigMenu = () => {
+    const composerRect = composerRef.current?.getBoundingClientRect()
+    const rect = configButtonRef.current?.getBoundingClientRect()
+    if (composerRect && rect) {
+      const placement = rect.top > window.innerHeight / 2 ? 'up' : 'down'
+      setConfigMenuStyle({
+        left: composerRect.left,
+        width: composerRect.width,
+        top: placement === 'down' ? composerRect.bottom + 8 : undefined,
+        bottom: placement === 'up' ? window.innerHeight - composerRect.top + 8 : undefined,
+      })
+    }
+    setConfigMenuOpen((open) => !open)
+  }
+
+  const chooseConfig = (id: string) => {
+    onModelConfigChange(id)
+    setConfigMenuOpen(false)
+  }
+
+  const isEmpty = timelineEntries.length === 0
+  const selectedConfig = useMemo(
+    () => modelConfigs.find((config) => config.id === selectedModelConfigId)
+      ?? modelConfigs.find((config) => config.is_default)
+      ?? modelConfigs[0]
+      ?? null,
+    [modelConfigs, selectedModelConfigId],
+  )
 
   const placeholder = useMemo(() => {
     if (!canAsk) {
       return isTaskRunning
-        ? '分析进行中，summary.md 写出后可在此追问…'
-        : '分析完成后可在此追问…'
+        ? '报告生成后可继续追问'
+        : '选择已完成任务后继续追问'
     }
-    return '就报告内容追问（Enter 发送，Shift+Enter 换行）'
+    return '询问这个类目的机会、风险或下一步动作'
   }, [canAsk, isTaskRunning])
 
   return (
@@ -324,14 +352,28 @@ export default function LiveStream({
           </div>
         ) : (
           <>
-            {sseItems.map((item) => {
+            {timelineEntries.map((entry) => {
+              if (entry.source === 'chat') {
+                const message = entry.message
+                return message.role === 'user' ? (
+                  <UserBubble key={entry.id} content={message.content} />
+                ) : (
+                  <AssistantText
+                    key={entry.id}
+                    content={message.content}
+                    streaming={!!message.streaming}
+                  />
+                )
+              }
+
+              const item = entry.item
               switch (item.kind) {
                 case 'system_note':
-                  return <SystemNote key={item.id} content={item.content} />
+                  return <SystemNote key={entry.id} content={item.content} />
                 case 'assistant_text':
                   return (
                     <AssistantText
-                      key={item.id}
+                      key={entry.id}
                       content={item.content}
                       streaming={!item.final}
                     />
@@ -339,31 +381,19 @@ export default function LiveStream({
                 case 'thinking':
                   return (
                     <Thinking
-                      key={item.id}
+                      key={entry.id}
                       content={item.content}
                       streaming={!item.final}
                     />
                   )
                 case 'tool_call':
-                  return <ToolCall key={item.id} item={item} />
+                  return <ToolCall key={entry.id} item={item} />
                 case 'final_result':
-                  return <FinalResult key={item.id} item={item} />
+                  return <FinalResult key={entry.id} item={item} />
                 default:
                   return null
               }
             })}
-
-            {localMessages.map((m) =>
-              m.role === 'user' ? (
-                <UserBubble key={m.id} content={m.content} />
-              ) : (
-                <AssistantText
-                  key={m.id}
-                  content={m.content}
-                  streaming={!!m.streaming}
-                />
-              )
-            )}
           </>
         )}
 
@@ -386,11 +416,12 @@ export default function LiveStream({
       )}
 
       {/* Input bar */}
-      <div className="border-t border-[var(--border-default)] bg-[var(--bg-raised)] px-5 py-3.5">
+      <div className="border-t border-[var(--border-default)] bg-[var(--bg-raised)] px-5 py-3">
         <div
-          className={`border rounded-[var(--radius-md)] overflow-hidden transition-all ${
+          ref={composerRef}
+          className={`mx-auto max-w-3xl border rounded-[var(--radius-md)] bg-[var(--bg-elevated)] shadow-sm transition-all ${
             !canAsk
-              ? 'border-[var(--border-default)] opacity-60'
+              ? 'border-[var(--border-default)] opacity-65'
               : 'border-[var(--border-default)] focus-within:border-[var(--accent)] focus-within:ring-2 focus-within:ring-[var(--accent-glow)]'
           }`}
         >
@@ -405,23 +436,103 @@ export default function LiveStream({
             disabled={!canAsk}
             placeholder={placeholder}
             rows={1}
-            className="w-full bg-transparent px-4 py-2.5 text-sm text-[var(--text-primary)] placeholder-[var(--text-disabled)] resize-none outline-none disabled:cursor-not-allowed"
+            className="block min-h-[44px] w-full resize-none bg-transparent px-4 pb-2 pt-3 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-disabled)] disabled:cursor-not-allowed"
           />
-          <div className="flex items-center justify-between px-3 py-2 bg-[var(--bg-overlay)]">
-            <span className="text-xs text-[var(--text-disabled)]">
-              {canAsk
-                ? 'Enter 发送 · Shift+Enter 换行'
-                : isTaskRunning
-                ? '等待 summary.md 生成…'
-                : '任务未完成'}
-            </span>
+          <div className="relative flex items-center justify-between gap-2 rounded-b-[var(--radius-md)] px-3 pb-3">
+            <div className="flex min-w-0 items-center gap-2">
+              {modelConfigs.length > 0 ? (
+                <button
+                  ref={configButtonRef}
+                  type="button"
+                  onMouseDown={(event) => {
+                    event.preventDefault()
+                    toggleConfigMenu()
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault()
+                      toggleConfigMenu()
+                    }
+                  }}
+                  className="inline-flex max-w-[220px] items-center gap-1.5 rounded-[var(--radius-xs)] px-2 py-1 text-[11px] text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-overlay)] hover:text-[var(--text-primary)]"
+                  title="切换默认模型配置"
+                >
+                  <Settings2 size={12} className="shrink-0" />
+                  <span className="truncate">{selectedConfig?.name || '选择配置'}</span>
+                  <span className="shrink-0 text-[var(--text-disabled)]">
+                    {selectedConfig?.default_model_family || 'sonnet'}
+                  </span>
+                  {configMenuOpen ? <ChevronUp size={12} className="shrink-0" /> : <ChevronDown size={12} className="shrink-0" />}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={onOpenSettings}
+                  className="inline-flex items-center gap-1.5 rounded-[var(--radius-xs)] px-2 py-1 text-[11px] text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-overlay)] hover:text-[var(--text-primary)]"
+                >
+                  <Settings2 size={12} />
+                  添加模型配置
+                </button>
+              )}
+              <span className="hidden text-[11px] text-[var(--text-disabled)] sm:inline">
+                {canAsk ? '报告上下文' : isTaskRunning ? '报告生成中' : '追问未解锁'}
+              </span>
+            </div>
+
+            {configMenuOpen && modelConfigs.length > 0 && (
+              <div
+                className="fixed z-[60] overflow-hidden rounded-[var(--radius-md)] border border-[var(--border-default)] bg-[var(--bg-raised)] shadow-xl"
+                style={configMenuStyle}
+              >
+                <div className="border-b border-[var(--border-default)] px-3.5 py-2.5">
+                  <p className="text-xs font-medium text-[var(--text-primary)]">运行配置</p>
+                  <p className="text-[11px] text-[var(--text-tertiary)]">用于新分析和未指定模型的 Agent 调用</p>
+                </div>
+                <div className="max-h-72 overflow-y-auto p-1.5">
+                  {modelConfigs.map((config) => {
+                    const active = config.id === selectedConfig?.id
+                    const family = config.default_model_family
+                    const model = family === 'opus' ? config.opus_model : config.sonnet_model
+                    return (
+                      <button
+                        key={config.id}
+                        type="button"
+                        onClick={() => chooseConfig(config.id)}
+                        className={`grid w-full grid-cols-[18px_minmax(0,1fr)_auto] items-start gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-left transition-colors ${
+                          active ? 'bg-[var(--accent-muted)]' : 'hover:bg-[var(--bg-overlay)]'
+                        }`}
+                      >
+                        <CheckCircle2
+                          size={13}
+                          className={`mt-0.5 shrink-0 ${active ? 'text-[var(--accent)]' : 'text-[var(--text-disabled)]'}`}
+                        />
+                        <span className="min-w-0">
+                          <span className="block text-xs font-medium text-[var(--text-primary)]">
+                            {config.name}
+                          </span>
+                          <span className="mt-0.5 block break-all text-[11px] leading-relaxed text-[var(--text-tertiary)]">
+                            {family}: {model}
+                          </span>
+                        </span>
+                        {config.is_default && (
+                          <span className="shrink-0 rounded-full bg-[var(--success-muted)] px-1.5 py-0.5 text-[10px] text-[var(--success)]">
+                            默认
+                          </span>
+                        )}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
             <button
               onClick={handleSend}
               disabled={!input.trim() || !canAsk}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-[var(--radius-xs)] text-xs bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white disabled:opacity-40 disabled:cursor-not-allowed transition-all cursor-pointer"
+              className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--text-primary)] text-white transition-all hover:bg-black disabled:cursor-not-allowed disabled:opacity-35"
+              title="发送"
             >
-              <Send size={11} />
-              发送
+              <ArrowUp size={15} />
             </button>
           </div>
         </div>

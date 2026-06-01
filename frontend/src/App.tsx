@@ -1,21 +1,79 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
-import { FileText, RotateCcw, RefreshCcw, AlertTriangle, X, ArrowUp } from 'lucide-react'
+import { useState, useEffect, useCallback, useRef, useMemo, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
+import { FileText, RotateCcw, RefreshCcw, AlertTriangle, X, ArrowUp, Settings2, ChevronDown, ChevronUp, CheckCircle2, ExternalLink } from 'lucide-react'
 import { api, openProgressSSE, streamChat } from './api'
-import type { Task, TaskStatus, Phases, Reports, StreamItem, StageInfo, AuthResponse, UserInfo, ModelFamily } from './api'
+import type { Task, TaskStatus, Phases, Reports, StreamItem, StageInfo, AuthResponse, UserInfo, ModelConfig } from './api'
 import Sidebar from './components/Sidebar'
 import ReportViewer from './components/ReportViewer'
-import NewTaskDialog from './components/NewTaskDialog'
 import StageRail from './components/StageRail'
-import LiveStream, { type LocalMessage } from './components/LiveStream'
+import LiveStream from './components/LiveStream'
 import ToastContainer, { useToast } from './components/Toast'
 import AuthPage from './components/AuthPage'
 import SettingsView from './components/SettingsView'
+import {
+  appendChatMessage,
+  appendStreamItem,
+  cloneTimelineState,
+  createTimelineState,
+  createTimelineStateFromHistory,
+  orderedTimelineEntries,
+  type LocalMessage,
+} from './timeline'
 
 const EMPTY_PHASES: Phases = { crawl: false, chunk: false, analyze: false, summary: false, qa: false }
+const SIDEBAR_DEFAULT_WIDTH = 256
+const SIDEBAR_MIN_WIDTH = 220
+const SIDEBAR_MAX_WIDTH = 380
+const STAGE_RAIL_DEFAULT_WIDTH = 256
+const STAGE_RAIL_MIN_WIDTH = 220
+const STAGE_RAIL_MAX_WIDTH = 420
+const MAIN_PANEL_MIN_WIDTH = 400
+const TOTAL_RESIZE_HANDLE_WIDTH = 12
 
-function EmptyState({ onCreate, creating }: { onCreate: (url: string) => void; creating: boolean }) {
+const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max)
+
+const EXAMPLE_URLS = [
+  {
+    label: 'Beauty 热门小类',
+    url: 'https://www.amazon.com/gp/bestsellers/beauty/11058221/',
+  },
+  {
+    label: 'Fashion 榜单观察',
+    url: 'https://www.amazon.com/gp/bestsellers/fashion/1040658/',
+  },
+  {
+    label: 'Home & Garden 样例',
+    url: 'https://www.amazon.com/gp/bestsellers/home-garden/3744541/',
+  },
+]
+
+function EmptyState({
+  onCreate,
+  creating,
+  modelConfigs = [],
+  selectedModelConfigId = null,
+  onModelConfigChange,
+  onOpenSettings,
+}: {
+  onCreate: (url: string) => void
+  creating: boolean
+  modelConfigs: ModelConfig[]
+  selectedModelConfigId: string | null
+  onModelConfigChange: (id: string) => void
+  onOpenSettings: () => void
+}) {
   const [url, setUrl] = useState('')
   const [error, setError] = useState('')
+  const [configMenuOpen, setConfigMenuOpen] = useState(false)
+  const [configMenuStyle, setConfigMenuStyle] = useState<CSSProperties>({})
+  const composerRef = useRef<HTMLDivElement>(null)
+  const configButtonRef = useRef<HTMLButtonElement>(null)
+  const selectedConfig = useMemo(
+    () => modelConfigs.find((config) => config.id === selectedModelConfigId)
+      ?? modelConfigs.find((config) => config.is_default)
+      ?? modelConfigs[0]
+      ?? null,
+    [modelConfigs, selectedModelConfigId],
+  )
 
   const submit = () => {
     const trimmed = url.trim()
@@ -31,13 +89,33 @@ function EmptyState({ onCreate, creating }: { onCreate: (url: string) => void; c
     onCreate(trimmed)
   }
 
+  const toggleConfigMenu = () => {
+    const composerRect = composerRef.current?.getBoundingClientRect()
+    const rect = configButtonRef.current?.getBoundingClientRect()
+    if (composerRect && rect) {
+      const placement = rect.top > window.innerHeight / 2 ? 'up' : 'down'
+      setConfigMenuStyle({
+        left: composerRect.left,
+        width: composerRect.width,
+        top: placement === 'down' ? composerRect.bottom + 8 : undefined,
+        bottom: placement === 'up' ? window.innerHeight - composerRect.top + 8 : undefined,
+      })
+    }
+    setConfigMenuOpen((open) => !open)
+  }
+
+  const chooseConfig = (id: string) => {
+    onModelConfigChange(id)
+    setConfigMenuOpen(false)
+  }
+
   return (
     <div className="flex h-full items-center justify-center px-8">
       <div className="w-full max-w-3xl">
         <h1 className="mb-8 text-center text-2xl font-medium tracking-normal text-[var(--text-primary)]">
           分析哪个 Amazon 类目？
         </h1>
-        <div className="overflow-hidden rounded-[var(--radius-xl)] border border-[var(--border-default)] bg-[var(--bg-raised)] shadow-sm">
+        <div ref={composerRef} className="rounded-[var(--radius-xl)] border border-[var(--border-default)] bg-[var(--bg-raised)] shadow-sm">
           <textarea
             value={url}
             onChange={(event) => setUrl(event.target.value)}
@@ -51,8 +129,92 @@ function EmptyState({ onCreate, creating }: { onCreate: (url: string) => void; c
             placeholder="粘贴 Amazon Bestsellers 类目 URL"
             className="block min-h-[92px] w-full resize-none bg-transparent px-4 py-3 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-disabled)]"
           />
-          <div className="flex items-center justify-between border-t border-[var(--border-default)] bg-[var(--bg-base)] px-3 py-2">
-            <span className="text-xs text-[var(--text-tertiary)]">amazon-bestsellers</span>
+          <div className="relative flex items-center justify-between gap-2 rounded-b-[var(--radius-xl)] border-t border-[var(--border-default)] bg-[var(--bg-base)] px-3 py-2">
+            <div className="flex min-w-0 items-center gap-2">
+              {modelConfigs.length > 0 ? (
+                <button
+                  ref={configButtonRef}
+                  type="button"
+                  onMouseDown={(event) => {
+                    event.preventDefault()
+                    toggleConfigMenu()
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault()
+                      toggleConfigMenu()
+                    }
+                  }}
+                  className="inline-flex max-w-[230px] items-center gap-1.5 rounded-[var(--radius-xs)] px-2 py-1 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-overlay)] hover:text-[var(--text-primary)]"
+                  title="切换默认模型配置"
+                >
+                  <Settings2 size={13} className="shrink-0" />
+                  <span className="truncate">{selectedConfig?.name || '选择配置'}</span>
+                  <span className="shrink-0 text-[var(--text-disabled)]">
+                    {selectedConfig?.default_model_family || 'sonnet'}
+                  </span>
+                  {configMenuOpen ? <ChevronUp size={13} className="shrink-0" /> : <ChevronDown size={13} className="shrink-0" />}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={onOpenSettings}
+                  className="inline-flex items-center gap-1.5 rounded-[var(--radius-xs)] px-2 py-1 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-overlay)] hover:text-[var(--text-primary)]"
+                >
+                  <Settings2 size={13} />
+                  添加模型配置
+                </button>
+              )}
+              <span className="hidden text-xs text-[var(--text-disabled)] sm:inline">amazon-bestsellers</span>
+            </div>
+
+            {configMenuOpen && modelConfigs.length > 0 && (
+              <div
+                className="fixed z-[60] overflow-hidden rounded-[var(--radius-md)] border border-[var(--border-default)] bg-[var(--bg-raised)] shadow-xl"
+                style={configMenuStyle}
+              >
+                <div className="border-b border-[var(--border-default)] px-3.5 py-2.5">
+                  <p className="text-xs font-medium text-[var(--text-primary)]">运行配置</p>
+                  <p className="text-[11px] text-[var(--text-tertiary)]">用于新建分析任务</p>
+                </div>
+                <div className="max-h-72 overflow-y-auto p-1.5">
+                  {modelConfigs.map((config) => {
+                    const active = config.id === selectedConfig?.id
+                    const family = config.default_model_family
+                    const model = family === 'opus' ? config.opus_model : config.sonnet_model
+                    return (
+                      <button
+                        key={config.id}
+                        type="button"
+                        onClick={() => chooseConfig(config.id)}
+                        className={`grid w-full grid-cols-[18px_minmax(0,1fr)_auto] items-start gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-left transition-colors ${
+                          active ? 'bg-[var(--accent-muted)]' : 'hover:bg-[var(--bg-overlay)]'
+                        }`}
+                      >
+                        <CheckCircle2
+                          size={13}
+                          className={`mt-0.5 shrink-0 ${active ? 'text-[var(--accent)]' : 'text-[var(--text-disabled)]'}`}
+                        />
+                        <span className="min-w-0">
+                          <span className="block text-xs font-medium text-[var(--text-primary)]">
+                            {config.name}
+                          </span>
+                          <span className="mt-0.5 block break-all text-[11px] leading-relaxed text-[var(--text-tertiary)]">
+                            {family}: {model}
+                          </span>
+                        </span>
+                        {config.is_default && (
+                          <span className="shrink-0 rounded-full bg-[var(--success-muted)] px-1.5 py-0.5 text-[10px] text-[var(--success)]">
+                            默认
+                          </span>
+                        )}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
             <button
               type="button"
               onClick={submit}
@@ -65,6 +227,25 @@ function EmptyState({ onCreate, creating }: { onCreate: (url: string) => void; c
           </div>
         </div>
         {error && <p className="mt-2 text-center text-xs text-[var(--error)]">{error}</p>}
+        <div className="mt-4 grid gap-2 sm:grid-cols-3">
+          {EXAMPLE_URLS.map((example) => (
+            <button
+              key={example.url}
+              type="button"
+              onClick={() => {
+                setUrl(example.url)
+                setError('')
+              }}
+              className="group flex min-h-[54px] items-start gap-2 rounded-[var(--radius-md)] border border-[var(--border-default)] bg-[var(--bg-raised)] px-3 py-2 text-left transition-colors hover:border-[var(--border-emphasis)] hover:bg-[var(--bg-overlay)]"
+            >
+              <ExternalLink size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)] group-hover:text-[var(--text-secondary)]" />
+              <span className="min-w-0">
+                <span className="block text-xs font-medium text-[var(--text-secondary)]">{example.label}</span>
+                <span className="mt-0.5 block truncate text-[11px] text-[var(--text-disabled)]">{example.url}</span>
+              </span>
+            </button>
+          ))}
+        </div>
         <p className="mt-4 text-center text-xs text-[var(--text-tertiary)]">
           默认使用设置页中的模型配置；已有中间数据会自动续跑。
         </p>
@@ -79,10 +260,9 @@ export default function App() {
   const [authChecked, setAuthChecked] = useState(false)
   const [tasks, setTasks] = useState<Task[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
-  const [showDialog, setShowDialog] = useState(false)
   const [creating, setCreating] = useState(false)
   const [resuming, setResuming] = useState(false)
-  const [refreshing, setRefreshing] = useState(false)
+  const [refreshingTaskId, setRefreshingTaskId] = useState<string | null>(null)
   const [reanalyzing, setReanalyzing] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [showReanalyzeConfirm, setShowReanalyzeConfirm] = useState(false)
@@ -97,11 +277,33 @@ export default function App() {
   const [stageCatalog, setStageCatalog] = useState<StageInfo[] | null>(null)
   const [streamItems, setStreamItems] = useState<Record<string, StreamItem>>({})
   const [streamOrder, setStreamOrder] = useState<string[]>([])
-  const [localMessages, setLocalMessages] = useState<LocalMessage[]>([])
+  const [timelineState, setTimelineState] = useState(createTimelineState)
   const [reports, setReports] = useState<{ path: string; data: Reports } | null>(null)
   const [currentCost, setCurrentCost] = useState<number>(0)
+  const [modelConfigs, setModelConfigs] = useState<ModelConfig[]>([])
+  const [selectedModelConfigId, setSelectedModelConfigId] = useState<string | null>(null)
+  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH)
+  const [stageRailWidth, setStageRailWidth] = useState(STAGE_RAIL_DEFAULT_WIDTH)
 
   const activeTask = tasks.find((t) => t.id === activeId) ?? null
+  const isActiveRefreshing = Boolean(activeId && refreshingTaskId === activeId)
+  const layoutViewportWidth = typeof window === 'undefined' ? 1280 : window.innerWidth
+  const maxStageRailWidth = activeTask
+    ? Math.max(
+      STAGE_RAIL_MIN_WIDTH,
+      Math.min(STAGE_RAIL_MAX_WIDTH, layoutViewportWidth - sidebarWidth - TOTAL_RESIZE_HANDLE_WIDTH - MAIN_PANEL_MIN_WIDTH),
+    )
+    : STAGE_RAIL_MAX_WIDTH
+  const effectiveStageRailWidth = activeTask
+    ? clamp(stageRailWidth, STAGE_RAIL_MIN_WIDTH, maxStageRailWidth)
+    : stageRailWidth
+  const maxSidebarWidth = activeTask
+    ? Math.max(
+      SIDEBAR_MIN_WIDTH,
+      Math.min(SIDEBAR_MAX_WIDTH, layoutViewportWidth - effectiveStageRailWidth - TOTAL_RESIZE_HANDLE_WIDTH - MAIN_PANEL_MIN_WIDTH),
+    )
+    : SIDEBAR_MAX_WIDTH
+  const effectiveSidebarWidth = clamp(sidebarWidth, SIDEBAR_MIN_WIDTH, maxSidebarWidth)
   const sseRef = useRef<EventSource | null>(null)
   const selectAbortRef = useRef<AbortController | null>(null)
 
@@ -129,13 +331,15 @@ export default function App() {
     return null
   }, [itemsArray])
 
+  const timelineEntries = useMemo(() => orderedTimelineEntries(timelineState), [timelineState])
+
   // ── Reset per-task state ─────────────────────────────────────────────────
   const resetTaskState = useCallback(() => {
     setPhases(EMPTY_PHASES)
     setStageCatalog(null)
     setStreamItems({})
     setStreamOrder([])
-    setLocalMessages([])
+    setTimelineState(createTimelineState())
     setReports(null)
     setShowReports(false)
     setCurrentCost(0)
@@ -153,8 +357,33 @@ export default function App() {
     }
   }, [])
 
+  const loadModelConfigs = useCallback(async () => {
+    const configs = await api.listModelConfigs()
+    setModelConfigs(configs)
+    const currentStillExists = selectedModelConfigId && configs.some((config) => config.id === selectedModelConfigId)
+    if (!currentStillExists) {
+      setSelectedModelConfigId(configs.find((config) => config.is_default)?.id ?? configs[0]?.id ?? null)
+    }
+    return configs
+  }, [selectedModelConfigId])
+
+  useEffect(() => {
+    if (user) {
+      loadModelConfigs().catch((err) => {
+        console.error('加载模型配置失败:', err)
+        toast.error('加载模型配置失败')
+      })
+    }
+  }, [loadModelConfigs, toast.error, user])
+
   const handleAuth = useCallback((data: AuthResponse) => {
-    setUser({ user_id: data.user_id, username: data.username, created_at: '' })
+    setUser({
+      user_id: data.user_id,
+      username: data.email || data.username,
+      email: data.email,
+      email_verified: data.email_verified,
+      created_at: data.created_at || '',
+    })
   }, [])
 
   const handleLogout = useCallback(() => {
@@ -187,6 +416,14 @@ export default function App() {
     return () => clearInterval(interval)
   }, [loadTasks, user])
 
+  useEffect(() => {
+    if (!refreshingTaskId) return
+    const task = tasks.find((item) => item.id === refreshingTaskId)
+    if (task && (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled')) {
+      setRefreshingTaskId(null)
+    }
+  }, [refreshingTaskId, tasks])
+
   // ── Handle SSE events ────────────────────────────────────────────────────
   const applySSEEvent = useCallback((event: string, data: unknown) => {
     if (event === 'phases') {
@@ -198,9 +435,11 @@ export default function App() {
       return
     }
     if (event === 'stream_item') {
-      const item = data as StreamItem
+      const incoming = data as StreamItem
+      const item = incoming.timestamp ? incoming : { ...incoming, timestamp: new Date().toISOString() }
       setStreamItems((prev) => ({ ...prev, [item.id]: item }))
       setStreamOrder((prev) => (prev.includes(item.id) ? prev : [...prev, item.id]))
+      setTimelineState((prev) => appendStreamItem(cloneTimelineState(prev), item))
       // 从 final_result 提取成本
       if (item.kind === 'final_result' && item.meta?.total_cost_usd) {
         setCurrentCost(item.meta.total_cost_usd)
@@ -249,7 +488,7 @@ export default function App() {
   }, [])
 
   // ── Switch active task ───────────────────────────────────────────────────
-  const selectTask = useCallback(async (id: string) => {
+  const selectTask = useCallback(async (id: string, taskSnapshot?: Task) => {
     // 取消上一次未完成的 selectTask，防止快速切换时竞态
     selectAbortRef.current?.abort()
     const controller = new AbortController()
@@ -261,8 +500,11 @@ export default function App() {
 
     const list = await loadTasks()
     if (controller.signal.aborted) return
-    const task = list.find((t) => t.id === id)
+    const task = list.find((t) => t.id === id) ?? taskSnapshot
     if (!task) return
+    if (taskSnapshot && !list.some((t) => t.id === id)) {
+      setTasks((prev) => [taskSnapshot, ...prev.filter((t) => t.id !== taskSnapshot.id)])
+    }
 
     // Always load reports (works for any task state — may return empty)
     try {
@@ -287,15 +529,17 @@ export default function App() {
         setStreamItems(itemsMap)
         setStreamOrder(history.stream_order)
       }
-      if (history.chat_messages.length > 0) {
-        const msgs: LocalMessage[] = history.chat_messages.map((m) => ({
+      setTimelineState(createTimelineStateFromHistory(
+        history.stream_items,
+        history.stream_order,
+        history.chat_messages.map((m) => ({
           id: `chat-${m.id}`,
           role: m.role,
           content: m.content,
           streaming: false,
-        }))
-        setLocalMessages(msgs)
-      }
+          createdAt: m.created_at,
+        })),
+      ))
     } catch (e) {
       console.error('加载历史记录失败:', e)
       toast.error('加载历史记录失败')
@@ -327,18 +571,30 @@ export default function App() {
   useEffect(() => () => { sseRef.current?.close() }, [])
 
   // ── Create task ──────────────────────────────────────────────────────────
-  const handleCreate = async (url: string, modelFamily?: ModelFamily) => {
+  const handleCreate = async (url: string) => {
     setCreating(true)
     try {
-      const task = await api.createTask(url, modelFamily ? { modelFamily } : undefined)
-      await loadTasks()
-      setShowDialog(false)
+      const task = await api.createTask(url)
+      setStatusFilter('')
+      setKeywordFilter('')
+      setTasks((prev) => [task, ...prev.filter((item) => item.id !== task.id)])
       setView('workspace')
-      selectTask(task.id)
+      await selectTask(task.id, task)
     } catch (err) {
       toast.error(`创建任务失败：${err}`)
     } finally {
       setCreating(false)
+    }
+  }
+
+  const handleModelConfigChange = async (id: string) => {
+    setSelectedModelConfigId(id)
+    try {
+      await api.setDefaultModelConfig(id)
+      setModelConfigs((prev) => prev.map((config) => ({ ...config, is_default: config.id === id })))
+    } catch (err) {
+      toast.error(`切换模型配置失败：${err}`)
+      await loadModelConfigs()
     }
   }
 
@@ -372,24 +628,31 @@ export default function App() {
   // ── Refresh task (incremental update) ────────────────────────────────────
   const handleRefresh = async () => {
     if (!activeId) return
-    setRefreshing(true)
+    const taskId = activeId
+    setRefreshingTaskId(taskId)
     try {
       // 乐观更新本地 task 状态，让 cancel 按钮立即可见
-      const updatedTask = await api.refreshTask(activeId)
-      setTasks((prev) => prev.map((t) => t.id === activeId ? updatedTask : t))
+      const updatedTask = await api.refreshTask(taskId)
+      setTasks((prev) => prev.map((t) => t.id === taskId ? updatedTask : t))
 
       // 追加系统消息，不清空现有 streamItems/streamOrder
       const msgId = `sys-refresh-${Date.now()}`
-      setStreamItems((prev) => ({ ...prev, [msgId]: {
-        id: msgId, kind: 'system_note', content: '🔄 正在刷新排名，获取最新榜单数据...', timestamp: new Date().toISOString(), final: true,
-      }}))
+      const startedItem: StreamItem = {
+        id: msgId,
+        kind: 'system_note',
+        content: '🔄 正在刷新排名，获取最新榜单数据...',
+        timestamp: new Date().toISOString(),
+        final: true,
+      }
+      setStreamItems((prev) => ({ ...prev, [msgId]: startedItem }))
       setStreamOrder((prev) => (prev.includes(msgId) ? prev : [...prev, msgId]))
+      setTimelineState((prev) => appendStreamItem(cloneTimelineState(prev), startedItem))
 
       // 建立 SSE 连接接收刷新进度，不调用 selectTask 以避免清空 streamItems
       sseRef.current?.close()
-      let changedCount = 0
+      let changedCount: number | null = null
       const es = openProgressSSE(
-        activeId,
+        taskId,
         (e) => {
           applySSEEvent(e.event, e.data)
           // 从 SSE 事件捕获 changed_count（不从 Task 对象读取，因为 Task 没有此字段）
@@ -399,24 +662,32 @@ export default function App() {
         },
         async () => {
           const refreshed = await loadTasks()
-          const ut = refreshed.find((t) => t.id === activeId)
-          if (ut) setTasks((prev) => prev.map((t) => t.id === activeId ? ut : t))
+          const ut = refreshed.find((t) => t.id === taskId)
+          if (ut) setTasks((prev) => prev.map((t) => t.id === taskId ? ut : t))
           // 刷新完成，追加完成消息
           const doneId = `sys-refresh-done-${Date.now()}`
-          const doneContent = changedCount > 0
+          const doneContent = changedCount === null
+            ? '✅ 刷新流程已结束，未收到排名变化统计'
+            : changedCount > 0
             ? `✅ 排名已更新，${changedCount} 个 ASIN 排名有变化`
             : `✅ 排名已更新，暂无变化`
-          setStreamItems((prev) => ({ ...prev, [doneId]: {
-            id: doneId, kind: 'system_note', content: doneContent, timestamp: new Date().toISOString(), final: true,
-          }}))
+          const doneItem: StreamItem = {
+            id: doneId,
+            kind: 'system_note',
+            content: doneContent,
+            timestamp: new Date().toISOString(),
+            final: true,
+          }
+          setStreamItems((prev) => ({ ...prev, [doneId]: doneItem }))
           setStreamOrder((prev) => (prev.includes(doneId) ? prev : [...prev, doneId]))
+          setTimelineState((prev) => appendStreamItem(cloneTimelineState(prev), doneItem))
+          setRefreshingTaskId((prev) => (prev === taskId ? null : prev))
         }
       )
       sseRef.current = es
     } catch (err) {
       toast.error(`刷新排名失败：${err}`)
-    } finally {
-      setRefreshing(false)
+      setRefreshingTaskId((prev) => (prev === taskId ? null : prev))
     }
   }
 
@@ -471,26 +742,97 @@ export default function App() {
     if (!activeId) return
     const userId = crypto.randomUUID()
     const asstId = crypto.randomUUID()
-    setLocalMessages((prev) => [
-      ...prev,
-      { id: userId, role: 'user', content: text },
-      { id: asstId, role: 'assistant', content: '', streaming: true },
-    ])
+    const now = new Date().toISOString()
+    const userMessage: LocalMessage = { id: userId, role: 'user', content: text, createdAt: now }
+    const assistantMessage: LocalMessage = { id: asstId, role: 'assistant', content: '', streaming: true, createdAt: now }
+    setTimelineState((prev) => {
+      const next = cloneTimelineState(prev)
+      appendChatMessage(next, userMessage)
+      appendChatMessage(next, assistantMessage)
+      return next
+    })
     try {
       for await (const chunk of streamChat(activeId, text)) {
-        setLocalMessages((prev) =>
-          prev.map((m) => (m.id === asstId ? { ...m, content: m.content + chunk } : m))
-        )
+        setTimelineState((prev) => {
+          const existing = prev.entries[`chat:${asstId}`]
+          if (existing?.source !== 'chat') return prev
+          const next = cloneTimelineState(prev)
+          appendChatMessage(next, {
+            ...existing.message,
+            content: existing.message.content + chunk,
+          })
+          return next
+        })
       }
     } catch (err) {
-      setLocalMessages((prev) =>
-        prev.map((m) => (m.id === asstId ? { ...m, content: `❌ 请求失败：${err}`, streaming: false } : m))
-      )
+      setTimelineState((prev) => {
+        const existing = prev.entries[`chat:${asstId}`]
+        if (existing?.source !== 'chat') return prev
+        const next = cloneTimelineState(prev)
+        appendChatMessage(next, {
+          ...existing.message,
+          content: `❌ 请求失败：${err}`,
+          streaming: false,
+        })
+        return next
+      })
     }
-    setLocalMessages((prev) =>
-      prev.map((m) => (m.id === asstId ? { ...m, streaming: false } : m))
-    )
+    setTimelineState((prev) => {
+      const existing = prev.entries[`chat:${asstId}`]
+      if (existing?.source !== 'chat') return prev
+      const next = cloneTimelineState(prev)
+      appendChatMessage(next, { ...existing.message, streaming: false })
+      return next
+    })
   }
+
+  const startSidebarResize = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    const startX = event.clientX
+    const startWidth = effectiveSidebarWidth
+    const maxWidth = activeTask
+      ? Math.max(
+        SIDEBAR_MIN_WIDTH,
+        Math.min(SIDEBAR_MAX_WIDTH, window.innerWidth - effectiveStageRailWidth - TOTAL_RESIZE_HANDLE_WIDTH - MAIN_PANEL_MIN_WIDTH),
+      )
+      : SIDEBAR_MAX_WIDTH
+    document.body.classList.add('is-resizing-columns')
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      setSidebarWidth(clamp(startWidth + moveEvent.clientX - startX, SIDEBAR_MIN_WIDTH, maxWidth))
+    }
+
+    const stopResize = () => {
+      document.body.classList.remove('is-resizing-columns')
+      document.removeEventListener('mousemove', handleMouseMove)
+    }
+
+    document.addEventListener('mousemove', handleMouseMove)
+    document.addEventListener('mouseup', stopResize, { once: true })
+  }, [activeTask, effectiveSidebarWidth, effectiveStageRailWidth])
+
+  const startStageRailResize = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    const startX = event.clientX
+    const startWidth = effectiveStageRailWidth
+    const maxWidth = Math.max(
+      STAGE_RAIL_MIN_WIDTH,
+      Math.min(STAGE_RAIL_MAX_WIDTH, window.innerWidth - effectiveSidebarWidth - TOTAL_RESIZE_HANDLE_WIDTH - MAIN_PANEL_MIN_WIDTH),
+    )
+    document.body.classList.add('is-resizing-columns')
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      setStageRailWidth(clamp(startWidth + startX - moveEvent.clientX, STAGE_RAIL_MIN_WIDTH, maxWidth))
+    }
+
+    const stopResize = () => {
+      document.body.classList.remove('is-resizing-columns')
+      document.removeEventListener('mousemove', handleMouseMove)
+    }
+
+    document.addEventListener('mousemove', handleMouseMove)
+    document.addEventListener('mouseup', stopResize, { once: true })
+  }, [effectiveSidebarWidth, effectiveStageRailWidth])
 
   const canAsk = phases.qa && activeTask?.status !== 'pending'
   const hasAnyReport = reports && Object.values(reports.data).some(Boolean)
@@ -528,7 +870,9 @@ export default function App() {
         }}
         onNew={() => {
           setView('workspace')
-          setShowDialog(true)
+          setActiveId(null)
+          resetTaskState()
+          sseRef.current?.close()
         }}
         onDelete={handleDelete}
         user={user}
@@ -539,15 +883,30 @@ export default function App() {
         keywordFilter={keywordFilter}
         onStatusFilterChange={setStatusFilter}
         onKeywordFilterChange={setKeywordFilter}
+        style={{ width: effectiveSidebarWidth }}
+      />
+      <div
+        className="resize-handle resize-handle-left"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="调整任务栏宽度"
+        onMouseDown={startSidebarResize}
       />
 
       {view === 'settings' ? (
         <div className="app-main-panel flex-1 overflow-y-auto">
-          <SettingsView onClose={() => setView('workspace')} onEnterEdit={() => setShowDialog(false)} />
+          <SettingsView onClose={() => setView('workspace')} onEnterEdit={() => undefined} />
         </div>
       ) : !activeTask ? (
         <main className="app-main-panel flex-1 flex flex-col min-h-screen overflow-hidden">
-          <EmptyState onCreate={handleCreate} creating={creating} />
+          <EmptyState
+            onCreate={handleCreate}
+            creating={creating}
+            modelConfigs={modelConfigs}
+            selectedModelConfigId={selectedModelConfigId}
+            onModelConfigChange={handleModelConfigChange}
+            onOpenSettings={() => setView('settings')}
+          />
         </main>
       ) : (
         <>
@@ -591,7 +950,7 @@ export default function App() {
                 <button
                   onClick={handleResume}
                   disabled={resuming}
-                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--bg-surface)] hover:bg-[var(--bg-overlay)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer disabled:opacity-50 transition-all duration-150 border border-[var(--border-default)]"
+                  className="flex shrink-0 whitespace-nowrap items-center gap-1.5 text-xs px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--bg-surface)] hover:bg-[var(--bg-overlay)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer disabled:opacity-50 transition-all duration-150 border border-[var(--border-default)]"
                 >
                   <RotateCcw size={11} className={resuming ? 'animate-spin' : ''} />
                   继续分析
@@ -601,11 +960,11 @@ export default function App() {
               {activeTask.status === 'completed' && phases.summary && (
                 <button
                   onClick={handleRefresh}
-                  disabled={refreshing}
-                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--bg-surface)] hover:bg-[var(--bg-overlay)] text-[var(--text-secondary)] cursor-pointer disabled:opacity-50 transition-all duration-150 border border-[var(--border-default)]"
+                  disabled={isActiveRefreshing}
+                  className="flex shrink-0 whitespace-nowrap items-center gap-1.5 text-xs px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--bg-surface)] hover:bg-[var(--bg-overlay)] text-[var(--text-secondary)] cursor-pointer disabled:opacity-50 transition-all duration-150 border border-[var(--border-default)]"
                 >
-                  <RefreshCcw size={11} className={refreshing ? 'animate-spin' : ''} />
-                  {refreshing ? '刷新中...' : '刷新排名'}
+                  <RefreshCcw size={11} className={isActiveRefreshing ? 'animate-spin' : ''} />
+                  {isActiveRefreshing ? '刷新中...' : '刷新排名'}
                 </button>
               )}
 
@@ -613,18 +972,18 @@ export default function App() {
                 <button
                   onClick={handleCancel}
                   disabled={cancelling}
-                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--error-muted)] hover:bg-[var(--error)]/10 text-[var(--error)] cursor-pointer disabled:opacity-50 transition-all duration-150 border border-[var(--error)]/20"
+                  className="flex shrink-0 whitespace-nowrap items-center gap-1.5 text-xs px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--error-muted)] hover:bg-[var(--error)]/10 text-[var(--error)] cursor-pointer disabled:opacity-50 transition-all duration-150 border border-[var(--error)]/20"
                 >
                   <AlertTriangle size={11} className={cancelling ? 'animate-spin' : ''} />
                   取消任务
                 </button>
               )}
 
-              {refreshing && (
+              {isActiveRefreshing && (
                 <button
                   onClick={handleCancel}
                   disabled={cancelling}
-                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--error)] hover:bg-[var(--error)]/90 text-white cursor-pointer disabled:opacity-50 transition-all duration-150 border border-[var(--error)]/20"
+                  className="flex shrink-0 whitespace-nowrap items-center gap-1.5 text-xs px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--error)] hover:bg-[var(--error)]/90 text-white cursor-pointer disabled:opacity-50 transition-all duration-150 border border-[var(--error)]/20"
                 >
                   <AlertTriangle size={11} className={cancelling ? 'animate-spin' : ''} />
                   取消刷新
@@ -635,7 +994,7 @@ export default function App() {
                 <button
                   onClick={() => setShowReanalyzeConfirm(true)}
                   disabled={reanalyzing}
-                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--error-muted)] hover:bg-[var(--error)]/10 text-[var(--error)] cursor-pointer disabled:opacity-50 transition-all duration-150 border border-[var(--error)]/20"
+                  className="flex shrink-0 whitespace-nowrap items-center gap-1.5 text-xs px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--error-muted)] hover:bg-[var(--error)]/10 text-[var(--error)] cursor-pointer disabled:opacity-50 transition-all duration-150 border border-[var(--error)]/20"
                 >
                   <AlertTriangle size={11} className={reanalyzing ? 'animate-spin' : ''} />
                   全量重新分析
@@ -648,7 +1007,7 @@ export default function App() {
                   setShowReports(true)
                 }}
                 disabled={!hasAnyReport}
-                className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed transition-all duration-150"
+                className="flex shrink-0 whitespace-nowrap items-center gap-1.5 text-xs px-3 py-1.5 rounded-[var(--radius-sm)] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed transition-all duration-150"
               >
                 <FileText size={11} />
                 报告 & 下载
@@ -658,18 +1017,28 @@ export default function App() {
             {/* Live stream body + input */}
             <div className="flex-1 min-h-0">
               <LiveStream
-                items={itemsArray}
-                localMessages={localMessages}
+                timelineEntries={timelineEntries}
                 onSend={handleSendChat}
                 canAsk={Boolean(canAsk)}
                 isTaskRunning={activeTask.status === 'running' || activeTask.status === 'pending'}
                 task={activeTask}
+                modelConfigs={modelConfigs}
+                selectedModelConfigId={selectedModelConfigId}
+                onModelConfigChange={handleModelConfigChange}
+                onOpenSettings={() => setView('settings')}
               />
             </div>
           </main>
 
           {/* Right stage rail */}
-          <div className="stage-rail-shell">
+          <div
+            className="resize-handle resize-handle-right"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="调整流水线栏宽度"
+            onMouseDown={startStageRailResize}
+          />
+          <div className="stage-rail-shell shrink-0" style={{ width: effectiveStageRailWidth }}>
             <StageRail
               task={activeTask}
               phases={phases}
@@ -718,15 +1087,6 @@ export default function App() {
 
       {/* Toast notifications */}
       <ToastContainer toasts={toast.toasts} onDismiss={toast.dismiss} />
-
-      {/* New task dialog */}
-      {showDialog && (
-        <NewTaskDialog
-          onSubmit={handleCreate}
-          onClose={() => setShowDialog(false)}
-          loading={creating}
-        />
-      )}
 
       {/* Reanalyze confirmation dialog */}
       {showReanalyzeConfirm && (

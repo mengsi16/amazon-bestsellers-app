@@ -1,4 +1,5 @@
-import { Plus, Trash2, CheckCircle, XCircle, Loader2, Clock, LogOut, Search, Filter, Settings, FolderKanban } from 'lucide-react'
+import type { CSSProperties } from 'react'
+import { Plus, Trash2, CheckCircle, XCircle, Loader2, Clock, LogOut, Search, Settings, FolderKanban } from 'lucide-react'
 import type { Task, TaskStatus, UserInfo } from '../api'
 
 interface Props {
@@ -16,6 +17,7 @@ interface Props {
   keywordFilter?: string
   onStatusFilterChange?: (s: TaskStatus | '') => void
   onKeywordFilterChange?: (k: string) => void
+  style?: CSSProperties
 }
 
 const statusIcon = (status: Task['status']) => {
@@ -45,12 +47,36 @@ const statusDot = (status: Task['status']) => {
   }
 }
 
+const statusFilterClass = (status: TaskStatus | '', active: boolean) => {
+  if (!active) {
+    return 'border border-transparent bg-transparent text-[var(--text-tertiary)] hover:border-[var(--accent)]/30 hover:bg-[var(--sidebar-hover)] hover:text-[var(--text-primary)]'
+  }
+  switch (status) {
+    case 'running':
+      return 'bg-[var(--accent-muted)] text-[var(--accent)] font-medium border border-[var(--accent)]/20'
+    case 'completed':
+      return 'bg-[var(--accent-muted)] text-[var(--accent)] font-medium border border-[var(--accent)]/20'
+    case 'failed':
+      return 'bg-[var(--accent-muted)] text-[var(--accent)] font-medium border border-[var(--accent)]/20'
+    case 'cancelled':
+      return 'bg-[var(--accent-muted)] text-[var(--accent)] font-medium border border-[var(--accent)]/20'
+    default:
+      return 'bg-[var(--accent-muted)] text-[var(--accent)] font-medium border border-[var(--accent)]/20'
+  }
+}
+
 export default function Sidebar({
   tasks, activeId, activeView = 'workspace', onSelect, onNew, onDelete, user, onLogout, onSettings, onWorkspace,
-  statusFilter = '', keywordFilter = '', onStatusFilterChange, onKeywordFilterChange,
+  statusFilter = '', keywordFilter = '', onStatusFilterChange, onKeywordFilterChange, style,
 }: Props) {
+  const workspaceActive = activeView === 'workspace' && !activeId
+  const activeTaskId = activeView === 'workspace' ? activeId : null
+
   return (
-    <aside className="app-sidebar w-64 shrink-0 bg-[var(--bg-deep)] border-r border-[var(--border-default)] flex flex-col h-screen sticky top-0">
+    <aside
+      className="app-sidebar shrink-0 bg-[var(--bg-deep)] border-r border-[var(--border-default)] flex flex-col h-screen sticky top-0"
+      style={style}
+    >
       {/* Header */}
       <div className="px-4 py-3.5 border-b border-[var(--border-default)]">
         <div className="flex items-center gap-2.5 mb-0.5">
@@ -81,7 +107,17 @@ export default function Sidebar({
       {/* New Analysis Button */}
       <div className="p-3">
         <button
-          onClick={onNew}
+          type="button"
+          onMouseDown={(event) => {
+            event.preventDefault()
+            onNew()
+          }}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault()
+              onNew()
+            }
+          }}
           className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-[var(--radius-sm)]
                      bg-[var(--bg-raised)] hover:bg-[var(--bg-overlay)] text-[var(--text-primary)] text-sm font-medium
                      transition-all duration-150 cursor-pointer border border-[var(--border-default)]"
@@ -103,17 +139,13 @@ export default function Sidebar({
             className="w-full pl-7 pr-2 py-1.5 bg-[var(--bg-deep)] border border-[var(--border-default)] rounded-[var(--radius-sm)] text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent-glow)] transition-all placeholder:text-[var(--text-disabled)]"
           />
         </div>
-        <div className="flex items-center gap-1 flex-wrap">
-          <Filter size={11} className="text-[var(--text-disabled)] shrink-0 mr-0.5" />
+        <div className="grid grid-cols-5 gap-1">
           {(['', 'running', 'completed', 'failed', 'cancelled'] as const).map((s) => (
             <button
               key={s}
               onClick={() => onStatusFilterChange?.(s)}
-              className={`px-1.5 py-0.5 rounded-[var(--radius-xs)] text-[10px] cursor-pointer transition-all duration-150 ${
-                statusFilter === s
-                  ? 'bg-[var(--accent-muted)] text-[var(--accent)] font-medium border border-[var(--accent)]/20'
-                  : 'bg-transparent text-[var(--text-tertiary)] hover:bg-[var(--bg-overlay)] hover:text-[var(--text-secondary)]'
-              }`}
+              aria-pressed={statusFilter === s}
+              className={`min-w-0 whitespace-nowrap px-1 py-0.5 rounded-[var(--radius-xs)] text-[10px] leading-4 cursor-pointer transition-all duration-150 ${statusFilterClass(s, statusFilter === s)}`}
             >
               {s === '' ? '全部' : statusLabel(s)}
             </button>
@@ -125,10 +157,11 @@ export default function Sidebar({
       <div className="flex-1 overflow-y-auto px-2 pb-4">
         <button
           onClick={onWorkspace}
+          aria-current={workspaceActive ? 'page' : undefined}
           className={`mb-2 flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-left text-xs transition-colors ${
-            activeView === 'workspace'
+            workspaceActive
               ? 'bg-[var(--bg-raised)] text-[var(--text-primary)] border border-[var(--border-default)]'
-              : 'text-[var(--text-secondary)] border border-transparent hover:bg-[var(--bg-overlay)]'
+              : 'text-[var(--text-secondary)] border border-transparent hover:border-[var(--accent)]/30 hover:bg-[var(--sidebar-hover)] hover:text-[var(--text-primary)]'
           }`}
         >
           <FolderKanban size={13} />
@@ -152,11 +185,20 @@ export default function Sidebar({
               <div
                 key={task.id}
                 onClick={() => onSelect(task.id)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault()
+                    onSelect(task.id)
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                aria-current={activeTaskId === task.id ? 'page' : undefined}
                 className={`
                   group relative rounded-[var(--radius-sm)] px-2.5 py-2 cursor-pointer transition-all duration-150
-                  ${activeId === task.id
+                  ${activeTaskId === task.id
                     ? 'bg-[var(--accent-muted)] border border-[var(--accent)]/20'
-                    : 'border border-transparent hover:bg-[var(--bg-overlay)]'}
+                    : 'border border-transparent hover:border-[var(--accent)]/30 hover:bg-[var(--sidebar-hover)]'}
                 `}
               >
                 <div className="flex items-start gap-2">
@@ -165,7 +207,7 @@ export default function Sidebar({
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className={`text-xs font-medium truncate leading-snug ${
-                      activeId === task.id ? 'text-[var(--text-primary)]' : 'text-[var(--text-secondary)]'
+                      activeTaskId === task.id ? 'text-[var(--text-primary)]' : 'text-[var(--text-secondary)] group-hover:text-[var(--text-primary)]'
                     }`}>
                       {task.browse_node_id}
                     </p>
@@ -204,10 +246,11 @@ export default function Sidebar({
       <div className="border-t border-[var(--border-default)] p-2">
         <button
           onClick={onSettings}
+          aria-current={activeView === 'settings' ? 'page' : undefined}
           className={`flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-left text-xs transition-colors ${
             activeView === 'settings'
               ? 'bg-[var(--bg-raised)] text-[var(--text-primary)] border border-[var(--border-default)]'
-              : 'text-[var(--text-secondary)] border border-transparent hover:bg-[var(--bg-overlay)]'
+              : 'text-[var(--text-secondary)] border border-transparent hover:border-[var(--accent)]/30 hover:bg-[var(--sidebar-hover)] hover:text-[var(--text-primary)]'
           }`}
         >
           <Settings size={13} />
