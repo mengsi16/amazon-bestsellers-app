@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { api, type AuthResponse } from '../api'
+import { api, type AuthResponse, type OAuthProvider } from '../api'
 import { Mail, X } from 'lucide-react'
 
 interface Props {
@@ -15,6 +15,7 @@ export default function AuthPage({ onAuth }: Props) {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [sendingCode, setSendingCode] = useState(false)
+  const [oauthLoading, setOauthLoading] = useState<OAuthProvider | null>(null)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -48,6 +49,18 @@ export default function AuthPage({ onAuth }: Props) {
     }
   }
 
+  const handleOAuth = async (provider: OAuthProvider) => {
+    setError('')
+    setOauthLoading(provider)
+    try {
+      const authorizationUrl = await api.oauthStartUrl(provider)
+      window.location.assign(authorizationUrl)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err))
+      setOauthLoading(null)
+    }
+  }
+
   const switchMode = (nextMode: 'login' | 'register') => {
     setMode(nextMode)
     setError('')
@@ -78,8 +91,9 @@ export default function AuthPage({ onAuth }: Props) {
           <div className="space-y-3">
             <button
               type="button"
-              onClick={() => setError('Google 登录需要先配置 OAuth Client ID')}
-              className="grid h-[52px] w-full grid-cols-[68px_1fr_68px] items-center rounded-full border border-[#d4d4d4] bg-white px-1 text-[16px] font-normal text-[#1f1f1f] transition-colors hover:bg-[#f8f8f8]"
+              onClick={() => handleOAuth('google')}
+              disabled={oauthLoading !== null}
+              className="grid h-[52px] w-full grid-cols-[68px_1fr_68px] items-center rounded-full border border-[#d4d4d4] bg-white px-1 text-[16px] font-normal text-[#1f1f1f] transition-colors hover:bg-[#f8f8f8] disabled:cursor-not-allowed disabled:opacity-60"
             >
               <svg className="mx-auto h-5 w-5" viewBox="0 0 48 48" aria-hidden="true">
                 <path fill="#EA4335" d="M24 9.5c3.4 0 6.4 1.2 8.8 3.5l6.6-6.6C35.4 2.7 30.2.5 24 .5 14.7.5 6.7 5.8 2.8 13.6l7.8 6.1C12.4 13.7 17.8 9.5 24 9.5Z" />
@@ -87,13 +101,14 @@ export default function AuthPage({ onAuth }: Props) {
                 <path fill="#FBBC05" d="M10.6 28.3A14.4 14.4 0 0 1 10.6 19.7l-7.8-6.1a23.5 23.5 0 0 0 0 20.8l7.8-6.1Z" />
                 <path fill="#34A853" d="M24 47.5c6.2 0 11.4-2 15.2-5.9l-7.3-5.7c-2 1.4-4.6 2.2-7.9 2.2-6.2 0-11.5-4.2-13.4-9.8l-7.8 6.1C6.7 42.2 14.7 47.5 24 47.5Z" />
               </svg>
-              <span className="text-center">使用 Google 账户继续</span>
+              <span className="text-center">{oauthLoading === 'google' ? '正在连接 Google...' : '使用 Google 账户继续'}</span>
               <span />
             </button>
             <button
               type="button"
-              onClick={() => setError('GitHub 登录需要先配置 OAuth App')}
-              className="grid h-[52px] w-full grid-cols-[68px_1fr_68px] items-center rounded-full border border-[#d4d4d4] bg-white px-1 text-[16px] font-normal text-[#1f1f1f] transition-colors hover:bg-[#f8f8f8]"
+              onClick={() => handleOAuth('github')}
+              disabled={oauthLoading !== null}
+              className="grid h-[52px] w-full grid-cols-[68px_1fr_68px] items-center rounded-full border border-[#d4d4d4] bg-white px-1 text-[16px] font-normal text-[#1f1f1f] transition-colors hover:bg-[#f8f8f8] disabled:cursor-not-allowed disabled:opacity-60"
             >
               <svg
                 className="mx-auto h-5 w-5 fill-[#111111]"
@@ -102,7 +117,7 @@ export default function AuthPage({ onAuth }: Props) {
               >
                 <path d="M12 2C6.48 2 2 6.59 2 12.25c0 4.53 2.86 8.37 6.84 9.73.5.09.68-.22.68-.49 0-.24-.01-1.05-.01-1.9-2.51.47-3.16-.62-3.36-1.19-.11-.29-.6-1.19-1.03-1.43-.35-.19-.85-.66-.01-.67.79-.01 1.35.74 1.54 1.05.9 1.55 2.34 1.11 2.91.85.09-.67.35-1.11.64-1.37-2.22-.26-4.55-1.14-4.55-5.05 0-1.11.39-2.03 1.03-2.75-.1-.26-.45-1.31.1-2.71 0 0 .84-.28 2.75 1.05A9.31 9.31 0 0 1 12 7.03c.85 0 1.71.12 2.51.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.4.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.92-2.34 4.79-4.57 5.05.36.32.68.93.68 1.9 0 1.37-.01 2.47-.01 2.81 0 .27.18.59.69.49A10.12 10.12 0 0 0 22 12.25C22 6.59 17.52 2 12 2Z" />
               </svg>
-              <span className="text-center">使用 GitHub 账户继续</span>
+              <span className="text-center">{oauthLoading === 'github' ? '正在连接 GitHub...' : '使用 GitHub 账户继续'}</span>
               <span />
             </button>
           </div>

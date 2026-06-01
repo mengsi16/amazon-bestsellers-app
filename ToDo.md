@@ -17,7 +17,7 @@
 | 15 | finished | 修复刷新内容插入到追问消息上方并拆分后端 stream 模块 | 新增计划文档；前端改为统一 timeline 渲染分析流水、刷新流水、用户追问、助手回答；后端 history 返回 stream timestamp 支持历史恢复按时间排序；后端 stream 存储与解析拆到 backend/streaming.py；前端时间线测试、后端 API 测试、前端构建和浏览器页面健康验证通过 |
 | 16 | finished | 修复追问后刷新排名实时流提示丢失与误报暂无变化 | 新增计划文档；1040658 发送“你好”后点击刷新，后端“收到增量更新请求”等新增刷新内容追加在最新回答下方；活跃刷新不会被旧 summary.md 提前收敛为 completed；未收到真实变化统计时不显示“暂无变化”；前后端测试、构建和浏览器复现通过 |
 | 17 | finished | 设计登录与用户系统 ER 图和实施文档 | 新增 md/2026-06-01-login-user-system-er-design.md；覆盖邮箱验证码、Google/GitHub OAuth、旧非邮箱账号清理、用户模型配置、后续自定义分析专家 Agent 的数据边界 |
-| 18 | executing | 实现邮箱验证码登录、Google 登录和 GitHub 登录 | 第一阶段已新增邮箱验证码注册/登录、非邮箱旧入口拒绝、登录页邮箱验证码流程；登录页已按参考图重做为白色圆角弹层；Google/GitHub OAuth 仍待接入真实 provider 配置和 callback |
+| 18 | finished | 实现邮箱验证码登录、Google 登录和 GitHub 登录 | 已新增邮箱验证码注册/登录、非邮箱旧入口拒绝、登录页邮箱验证码流程；登录页已按参考图重做为白色圆角弹层；Google/GitHub OAuth 已接入 start-url、callback、账号绑定和前端按钮跳转；运行环境需配置对应 OAuth client id/secret |
 | 19 | pending | 设计并实现用户自定义分析专家 Agent 配置 | 先审查 orchestrator 调度和 agent 契约；只允许用户配置分析类 agent，不动爬虫、分块、清洗和 audit |
 | 20 | pending | 拆分 backend/main.py 的认证、任务、模型配置和进度模块 | 先写模块边界计划；拆分后接口行为、SQLite schema 初始化、SSE 与任务状态回归测试保持通过 |
 | 21 | finished | 修复刷新按钮卡在刷新中 | 已完成任务的刷新按钮不受其他任务运行态影响；刷新完成后即使 SSE 完成回调丢失，也能通过任务轮询恢复为刷新排名；前端构建、后端 API 测试和浏览器验证通过 |

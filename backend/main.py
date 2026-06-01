@@ -34,6 +34,8 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import AsyncGenerator, Optional
+from urllib.parse import urlencode
+from urllib.request import Request as UrlRequest, urlopen
 
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
@@ -44,7 +46,7 @@ import aiofiles
 import bcrypt
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from slowapi import Limiter
@@ -378,6 +380,27 @@ _AUTH_EXEMPT_PATHS = {
     "/openapi.json",
     "/redoc",
 }
+_OAUTH_PROVIDERS = {"google", "github"}
+_OAUTH_CONFIG = {
+    "google": {
+        "client_id_env": "GOOGLE_OAUTH_CLIENT_ID",
+        "client_secret_env": "GOOGLE_OAUTH_CLIENT_SECRET",
+        "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_url": "https://oauth2.googleapis.com/token",
+        "scope": "openid email profile",
+    },
+    "github": {
+        "client_id_env": "GITHUB_OAUTH_CLIENT_ID",
+        "client_secret_env": "GITHUB_OAUTH_CLIENT_SECRET",
+        "authorize_url": "https://github.com/login/oauth/authorize",
+        "token_url": "https://github.com/login/oauth/access_token",
+        "scope": "read:user user:email",
+    },
+}
+
+
+def _is_auth_exempt_path(path: str) -> bool:
+    return path in _AUTH_EXEMPT_PATHS or path.startswith("/api/auth/oauth/")
 
 
 def _hash_password(password: str) -> str:
@@ -493,6 +516,234 @@ def _auth_response(user_id: str, email: str, created_at: str = "") -> dict:
         "created_at": created_at,
         "token": token,
     }
+
+
+def _normalize_oauth_provider(provider: str) -> str:
+    normalized = provider.strip().lower()
+    if normalized not in _OAUTH_PROVIDERS:
+        raise HTTPException(status_code=404, detail="OAuth provider not supported")
+    return normalized
+
+
+def _oauth_client_config(provider: str) -> tuple[str, str]:
+    config = _OAUTH_CONFIG[provider]
+    client_id = os.environ.get(config["client_id_env"], "").strip()
+    client_secret = os.environ.get(config["client_secret_env"], "").strip()
+    if not client_id or not client_secret:
+        label = "Google" if provider == "google" else "GitHub"
+        raise HTTPException(status_code=503, detail=f"{label} OAuth 未配置，请设置 client id 和 client secret")
+    return client_id, client_secret
+
+
+def _oauth_redirect_uri(request: Request, provider: str) -> str:
+    base = os.environ.get("OAUTH_REDIRECT_BASE_URL", "").strip().rstrip("/")
+    if base:
+        return f"{base}/api/auth/oauth/{provider}/callback"
+    return str(request.url_for("oauth_callback", provider=provider))
+
+
+def _create_oauth_state(provider: str) -> str:
+    from datetime import timedelta
+
+    expire = datetime.utcnow() + timedelta(minutes=10)
+    payload = {
+        "provider": provider,
+        "nonce": secrets.token_urlsafe(16),
+        "exp": expire,
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY_CURRENT, algorithm=JWT_ALGORITHM)
+
+
+def _verify_oauth_state(provider: str, state: str) -> None:
+    payload = _decode_jwt(state)
+    if payload is None or payload.get("provider") != provider:
+        raise HTTPException(status_code=400, detail="OAuth state 无效或已过期")
+
+
+def _oauth_authorization_url(provider: str, request: Request) -> str:
+    client_id, _client_secret = _oauth_client_config(provider)
+    config = _OAUTH_CONFIG[provider]
+    params = {
+        "client_id": client_id,
+        "redirect_uri": _oauth_redirect_uri(request, provider),
+        "response_type": "code",
+        "scope": config["scope"],
+        "state": _create_oauth_state(provider),
+    }
+    if provider == "google":
+        params["access_type"] = "online"
+        params["prompt"] = "select_account"
+    return f"{config['authorize_url']}?{urlencode(params)}"
+
+
+def _http_post_form_json(url: str, data: dict[str, str], headers: dict[str, str] | None = None) -> dict:
+    request = UrlRequest(
+        url,
+        data=urlencode(data).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            **(headers or {}),
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _http_get_json(url: str, access_token: str) -> dict | list:
+    request = UrlRequest(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+        },
+        method="GET",
+    )
+    with urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _exchange_oauth_code(provider: str, code: str, redirect_uri: str) -> dict:
+    client_id, client_secret = _oauth_client_config(provider)
+    config = _OAUTH_CONFIG[provider]
+    return _http_post_form_json(config["token_url"], {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": redirect_uri,
+    })
+
+
+def _fetch_oauth_profile(provider: str, access_token: str) -> dict:
+    if provider == "google":
+        profile = _http_get_json("https://openidconnect.googleapis.com/v1/userinfo", access_token)
+        if not isinstance(profile, dict):
+            raise HTTPException(status_code=502, detail="Google 用户信息格式异常")
+        return {
+            "provider_user_id": str(profile.get("sub", "")),
+            "email": str(profile.get("email", "")),
+            "email_verified": bool(profile.get("email_verified")),
+            "display_name": str(profile.get("name", "")),
+            "avatar_url": str(profile.get("picture", "")),
+        }
+
+    user = _http_get_json("https://api.github.com/user", access_token)
+    if not isinstance(user, dict):
+        raise HTTPException(status_code=502, detail="GitHub 用户信息格式异常")
+    email = str(user.get("email") or "")
+    email_verified = bool(email)
+    if not email:
+        emails = _http_get_json("https://api.github.com/user/emails", access_token)
+        if not isinstance(emails, list):
+            raise HTTPException(status_code=502, detail="GitHub 邮箱信息格式异常")
+        primary = next(
+            (
+                item for item in emails
+                if isinstance(item, dict) and item.get("primary") and item.get("verified") and item.get("email")
+            ),
+            None,
+        )
+        if primary:
+            email = str(primary["email"])
+            email_verified = True
+    return {
+        "provider_user_id": str(user.get("id", "")),
+        "email": email,
+        "email_verified": email_verified,
+        "display_name": str(user.get("name") or user.get("login") or ""),
+        "avatar_url": str(user.get("avatar_url") or ""),
+    }
+
+
+def _login_oauth_user(provider: str, profile: dict) -> dict:
+    provider_user_id = str(profile.get("provider_user_id", "")).strip()
+    email = _normalize_email(str(profile.get("email", "")))
+    if not provider_user_id:
+        raise HTTPException(status_code=400, detail="OAuth 用户 ID 缺失")
+    if not bool(profile.get("email_verified")):
+        raise HTTPException(status_code=400, detail="OAuth 邮箱未验证")
+
+    now = datetime.utcnow().isoformat()
+    identity = _db.execute(
+        "SELECT user_id FROM auth_identities WHERE provider = ? AND provider_user_id = ?",
+        (provider, provider_user_id),
+    ).fetchone()
+    user_row = None
+    if identity is not None:
+        user_row = _db.execute(
+            "SELECT id, created_at FROM users WHERE id = ?",
+            (identity[0],),
+        ).fetchone()
+    if user_row is None:
+        user_row = _db.execute(
+            "SELECT id, created_at FROM users WHERE email = ? OR username = ?",
+            (email, email),
+        ).fetchone()
+    if user_row is None:
+        user_id = str(uuid.uuid4())[:12]
+        _db.execute(
+            "INSERT INTO users "
+            "(id, username, email, email_verified, password_hash, display_name, avatar_url, created_at, updated_at, last_login_at) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+            (
+                user_id,
+                email,
+                email,
+                _hash_password(secrets.token_urlsafe(32)),
+                str(profile.get("display_name") or email),
+                str(profile.get("avatar_url") or ""),
+                now,
+                now,
+                now,
+            ),
+        )
+        created_at = now
+    else:
+        user_id = user_row[0]
+        created_at = user_row[1]
+        _db.execute(
+            "UPDATE users SET email = ?, email_verified = 1, display_name = ?, avatar_url = ?, updated_at = ?, last_login_at = ? "
+            "WHERE id = ?",
+            (
+                email,
+                str(profile.get("display_name") or email),
+                str(profile.get("avatar_url") or ""),
+                now,
+                now,
+                user_id,
+            ),
+        )
+
+    _db.execute(
+        "INSERT OR IGNORE INTO auth_identities "
+        "(id, user_id, provider, provider_user_id, provider_email, created_at, last_login_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (str(uuid.uuid4())[:12], user_id, provider, provider_user_id, email, now, now),
+    )
+    _db.execute(
+        "UPDATE auth_identities SET provider_email = ?, last_login_at = ? "
+        "WHERE provider = ? AND provider_user_id = ?",
+        (email, now, provider, provider_user_id),
+    )
+    _db.commit()
+    return _auth_response(user_id, email, created_at)
+
+
+def _oauth_success_html(auth: dict) -> str:
+    payload = json.dumps(auth, ensure_ascii=False)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>登录成功</title></head>
+<body>
+<script>
+const auth = {payload};
+localStorage.setItem('token', auth.token);
+location.replace('/');
+</script>
+</body>
+</html>"""
 
 
 def _decode_jwt(token: str) -> Optional[dict]:
@@ -1629,7 +1880,7 @@ app.add_middleware(
 async def jwt_auth_middleware(request: Request, call_next):
     """对 /api 下非豁免路径强制 JWT 认证。支持 Authorization header 和 ?token= 查询参数。"""
     path = request.url.path
-    if path.startswith("/api") and path not in _AUTH_EXEMPT_PATHS:
+    if path.startswith("/api") and not _is_auth_exempt_path(path):
         # 优先从 header 获取，其次从 query 参数获取（SSE 场景）
         auth = request.headers.get("Authorization", "")
         token = None
@@ -1713,6 +1964,35 @@ def _login_email(email: str, password: str) -> dict:
 async def email_login(req: EmailLoginRequest, request: Request):
     email = _normalize_email(req.email)
     return _login_email(email, req.password)
+
+
+@app.get("/api/auth/oauth/{provider}/start-url")
+async def oauth_start_url(provider: str, request: Request):
+    normalized_provider = _normalize_oauth_provider(provider)
+    return {"authorization_url": _oauth_authorization_url(normalized_provider, request)}
+
+
+@app.get("/api/auth/oauth/{provider}/start")
+async def oauth_start(provider: str, request: Request):
+    normalized_provider = _normalize_oauth_provider(provider)
+    return RedirectResponse(_oauth_authorization_url(normalized_provider, request))
+
+
+@app.get("/api/auth/oauth/{provider}/callback")
+async def oauth_callback(provider: str, request: Request, code: str, state: str):
+    normalized_provider = _normalize_oauth_provider(provider)
+    _verify_oauth_state(normalized_provider, state)
+    token_data = _exchange_oauth_code(
+        normalized_provider,
+        code,
+        _oauth_redirect_uri(request, normalized_provider),
+    )
+    access_token = str(token_data.get("access_token") or "")
+    if not access_token:
+        raise HTTPException(status_code=400, detail="OAuth token 响应缺少 access_token")
+    profile = _fetch_oauth_profile(normalized_provider, access_token)
+    auth = _login_oauth_user(normalized_provider, profile)
+    return HTMLResponse(_oauth_success_html(auth))
 
 
 @app.post("/api/auth/register")

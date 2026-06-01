@@ -4,6 +4,7 @@ import pytest
 import sys
 import os
 import json
+from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -212,6 +213,132 @@ class TestAuthEndpoints:
             "password": "password123",
         })
         assert login_resp.status_code == 400
+
+    def test_oauth_start_url_requires_provider_config(self, client, monkeypatch):
+        """OAuth 未配置 client id/secret 时应返回可展示的配置错误。"""
+        monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_ID", raising=False)
+        monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_SECRET", raising=False)
+
+        resp = client.get("/api/auth/oauth/google/start-url")
+
+        assert resp.status_code == 503
+        assert "Google OAuth 未配置" in resp.json()["detail"]
+
+    def test_google_oauth_start_url_contains_state_and_redirect_uri(self, client, monkeypatch):
+        """Google OAuth start-url 应返回带 state 与 callback 的授权地址。"""
+        monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "google-client-id")
+        monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "google-client-secret")
+
+        resp = client.get("/api/auth/oauth/google/start-url")
+
+        assert resp.status_code == 200
+        url = resp.json()["authorization_url"]
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        assert parsed.netloc == "accounts.google.com"
+        assert query["client_id"] == ["google-client-id"]
+        assert query["response_type"] == ["code"]
+        assert "openid" in query["scope"][0]
+        assert query["state"][0]
+        assert query["redirect_uri"][0].endswith("/api/auth/oauth/google/callback")
+
+    def test_google_oauth_callback_creates_user_and_identity(self, client, monkeypatch):
+        """Google callback 应根据已验证邮箱创建用户并写入本地 JWT。"""
+        import main
+
+        monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "google-client-id")
+        monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "google-client-secret")
+        monkeypatch.setattr(
+            main,
+            "_exchange_oauth_code",
+            lambda provider, code, redirect_uri: {"access_token": f"{provider}-{code}-token"},
+            raising=False,
+        )
+        monkeypatch.setattr(
+            main,
+            "_fetch_oauth_profile",
+            lambda provider, access_token: {
+                "provider_user_id": "google-user-1",
+                "email": "oauth-google@xxx.com",
+                "email_verified": True,
+                "display_name": "OAuth Google",
+                "avatar_url": "https://example.com/google.png",
+            },
+            raising=False,
+        )
+        start = client.get("/api/auth/oauth/google/start-url").json()["authorization_url"]
+        state = parse_qs(urlparse(start).query)["state"][0]
+
+        resp = client.get("/api/auth/oauth/google/callback", params={
+            "code": "abc123",
+            "state": state,
+        })
+
+        assert resp.status_code == 200
+        assert "localStorage.setItem('token'" in resp.text
+        row = main._db.execute(
+            "SELECT u.email, ai.provider, ai.provider_user_id "
+            "FROM users u JOIN auth_identities ai ON ai.user_id = u.id "
+            "WHERE u.email = ?",
+            ("oauth-google@xxx.com",),
+        ).fetchone()
+        assert row == ("oauth-google@xxx.com", "google", "google-user-1")
+
+    def test_github_oauth_callback_links_existing_email_user(self, client, monkeypatch):
+        """GitHub callback 遇到同邮箱用户时应绑定身份而不是创建重复用户。"""
+        import main
+
+        email = "linked-github@xxx.com"
+        code_resp = client.post("/api/auth/email/send-code", json={
+            "email": email,
+            "purpose": "register",
+        })
+        existing_resp = client.post("/api/auth/email/register", json={
+            "email": email,
+            "password": "password123",
+            "code": code_resp.json()["dev_code"],
+        })
+        assert existing_resp.status_code == 200
+        existing_user_id = existing_resp.json()["user_id"]
+
+        monkeypatch.setenv("GITHUB_OAUTH_CLIENT_ID", "github-client-id")
+        monkeypatch.setenv("GITHUB_OAUTH_CLIENT_SECRET", "github-client-secret")
+        monkeypatch.setattr(
+            main,
+            "_exchange_oauth_code",
+            lambda provider, code, redirect_uri: {"access_token": f"{provider}-{code}-token"},
+            raising=False,
+        )
+        monkeypatch.setattr(
+            main,
+            "_fetch_oauth_profile",
+            lambda provider, access_token: {
+                "provider_user_id": "github-user-1",
+                "email": email,
+                "email_verified": True,
+                "display_name": "OAuth GitHub",
+                "avatar_url": "https://example.com/github.png",
+            },
+            raising=False,
+        )
+        start = client.get("/api/auth/oauth/github/start-url").json()["authorization_url"]
+        state = parse_qs(urlparse(start).query)["state"][0]
+
+        resp = client.get("/api/auth/oauth/github/callback", params={
+            "code": "def456",
+            "state": state,
+        })
+
+        assert resp.status_code == 200
+        rows = main._db.execute(
+            "SELECT user_id, provider, provider_user_id FROM auth_identities WHERE provider = 'github'",
+        ).fetchall()
+        assert rows == [(existing_user_id, "github", "github-user-1")]
+        user_count = main._db.execute(
+            "SELECT count(*) FROM users WHERE email = ?",
+            (email,),
+        ).fetchone()[0]
+        assert user_count == 1
 
 
 class TestTaskEndpoints:

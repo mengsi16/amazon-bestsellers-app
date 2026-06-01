@@ -173,6 +173,8 @@ export interface EmailCodeResponse {
   dev_code?: string
 }
 
+export type OAuthProvider = 'google' | 'github'
+
 export const api = {
   // ── 认证接口 ────────────────────────────────────────────────────────────
   async register(username: string, password: string): Promise<AuthResponse> {
@@ -254,6 +256,16 @@ export const api = {
     const data: AuthResponse = await res.json()
     setToken(data.token)
     return data
+  },
+
+  async oauthStartUrl(provider: OAuthProvider): Promise<string> {
+    const res = await fetch(`${BASE}/auth/oauth/${provider}/start-url`)
+    if (!res.ok) {
+      const err = await res.json() as { detail?: string }
+      throw new Error(err.detail || 'OAuth 登录未配置')
+    }
+    const data = await res.json() as { authorization_url: string }
+    return data.authorization_url
   },
 
   async me(): Promise<UserInfo> {
