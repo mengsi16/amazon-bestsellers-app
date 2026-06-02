@@ -7,6 +7,7 @@ workspace/
 
 # local env and secrets
 .env
+.secrets/
 
 # local docs/work notes
 md/

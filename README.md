@@ -47,10 +47,11 @@
 | 类目分析任务 | 输入 Amazon Bestsellers 类目 URL，创建分析任务并自动解析 Browse Node ID |
 | 实时进度 | 通过 SSE 展示 Claude Code stream-json、工具调用、系统日志和执行阶段 |
 | 报告阅读 | 在前端阅读 summary、marketplace、reviews、A+ content、fine-grained 等 Markdown 报告 |
-| 连续追问 | 对已完成任务继续提问，后端复用任务 workspace 与 Claude Code session |
+| 连续追问 | 对已完成任务继续提问，后端使用任务 owner 的模型配置、workspace 与 Claude Code session |
 | 刷新与重跑 | 支持刷新排名、断点续跑、全量重新分析、取消和删除任务 |
 | 用户认证 | 支持邮箱验证码注册登录，预留 Google 与 GitHub OAuth 配置入口 |
-| 模型配置 | 多套模型配置、默认模型切换、API Key 加密保存 |
+| 用户级模型配置 | 每个用户维护自己的 API Key、Base URL 和模型名；任务启动时按 owner 注入子进程环境，避免多账号串配置 |
+| 任务隔离与复用审计 | 私有任务、stream history、chat history 默认只允许 owner 访问；同一 Browse Node workspace 可复用，但会写入 cache_usages 审计记录 |
 | Credits 统计 | 从 Claude Code 结果事件中提取 token 与费用，用 SQLite 持久化 |
 | 历史恢复 | stream items 与 chat messages 持久化，切换任务或重启服务后可恢复上下文 |
 
@@ -101,15 +102,15 @@ sequenceDiagram
 
     U->>F: "提交 Bestsellers URL"
     F->>B: "POST /api/tasks"
-    B->>W: "创建 task 与 workspace"
-    B->>C: "启动 claude --output-format stream-json"
+    B->>W: "创建 owner task、workspace 与缓存复用记录"
+    B->>C: "按 task owner 注入 API Key/Base URL 并启动 claude"
     C->>A: "执行 orchestrator"
     A->>W: "写入抓取数据、chunks、报告"
     C-->>B: "stream-json 事件"
     B-->>F: "SSE 实时进度"
     U->>F: "阅读报告或继续追问"
     F->>B: "POST /api/tasks/{id}/chat"
-    B->>C: "复用 session_id 与 workspace 上下文"
+    B->>C: "使用 task owner 配置复用 session_id 与 workspace 上下文"
     C-->>F: "流式回答"
 ```
 
@@ -117,7 +118,7 @@ sequenceDiagram
 
 ### Docker Compose
 
-复制 `.env.example` 为 `.env`，至少为生产环境设置 `JWT_SECRET_KEY` 和 `CREDITS_ENCRYPTION_KEY`。需要 OAuth 登录时，再配置 Google 和 GitHub client 信息。
+复制 `.env.example` 为 `.env`。本地开发时 `CREDITS_ENCRYPTION_KEY` 可以留空，后端启动会自动生成并写回 `.env`，同时备份到 `.secrets/CREDITS_ENCRYPTION_KEY.bak`；生产环境建议用 Secret/环境变量显式设置，且必须设置 `JWT_SECRET_KEY`。需要 OAuth 登录时，再配置 Google 和 GitHub client 信息。
 
 ```bash
 docker-compose up -d --build
@@ -165,7 +166,7 @@ npm run dev
 | `JWT_SECRET_KEY` | 生产环境是 | 开发环境随机生成 | JWT 签名密钥 |
 | `JWT_SECRET_KEY_PREVIOUS` | 否 | 空 | 密钥轮换期间的旧 JWT 密钥 |
 | `CORS_ORIGINS` | 否 | `http://localhost:5173` | 允许的前端来源，逗号分隔 |
-| `CREDITS_ENCRYPTION_KEY` | 生产环境是 | 开发环境随机生成 | 模型配置 API Key 加密密钥 |
+| `CREDITS_ENCRYPTION_KEY` | 生产环境建议显式设置 | 本地启动自动生成 | 模型配置 API Key 加密密钥；本地自动写入 `.env` 并备份到 `.secrets/` |
 | `PORT` | 否 | `8000` | 后端端口 |
 | `DB_PATH` | 否 | `backend/conversations.db` | SQLite 数据库路径 |
 | `WORKSPACE_BASE` | 否 | `backend/workspace` | 分析产物目录 |
@@ -189,7 +190,7 @@ npm run dev
 
 | 数据 | 默认位置 | 说明 |
 |---|---|---|
-| SQLite | `backend/conversations.db` | 用户、任务、会话、stream items、chat messages、模型配置和 Credits |
+| SQLite | `backend/conversations.db` | 用户、任务、会话、stream items、chat messages、用户级模型配置、缓存复用记录和 Credits |
 | Workspace | `backend/workspace` | 抓取数据、商品 HTML、图片、chunks、reports、分析元数据 |
 | Docker SQLite | `/app/data/conversations.db` | 通过 `backend-db` volume 保存 |
 | Docker Workspace | `/app/workspace` | 通过 `backend-data` volume 保存 |

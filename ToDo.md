@@ -19,7 +19,9 @@
 | 17 | finished | 设计登录与用户系统 ER 图和实施文档 | 新增 md/2026-06-01-login-user-system-er-design.md；覆盖邮箱验证码、Google/GitHub OAuth、旧非邮箱账号清理、用户模型配置、后续自定义分析专家 Agent 的数据边界 |
 | 18 | finished | 实现邮箱验证码登录、Google 登录和 GitHub 登录 | 已新增邮箱验证码注册/登录、非邮箱旧入口拒绝、登录页邮箱验证码流程；登录页已按参考图重做为白色圆角弹层；Google/GitHub OAuth 已接入 start-url、callback、账号绑定和前端按钮跳转；运行环境需配置对应 OAuth client id/secret |
 | 19 | pending | 设计并实现用户自定义分析专家 Agent 配置 | 先审查 orchestrator 调度和 agent 契约；只允许用户配置分析类 agent，不动爬虫、分块、清洗和 audit |
-| 20 | pending | 拆分 backend/main.py 的认证、任务、模型配置和进度模块 | 先写模块边界计划；拆分后接口行为、SQLite schema 初始化、SSE 与任务状态回归测试保持通过 |
+| 20 | finished | 实现跨账号类目缓存复用审计与用户配置隔离 | 新增计划文档；用户 task 读写接口统一 owner/public 校验；Claude session 不跨账号继承；无用户模型配置时 fail-fast；新增 cache_usages 记录 task 对类目 workspace 的复用 |
+| 24 | pending | 拆分 backend/main.py 的认证、任务、模型配置和进度模块 | 先写模块边界计划；拆分后接口行为、SQLite schema 初始化、SSE 与任务状态回归测试保持通过 |
 | 21 | finished | 修复刷新按钮卡在刷新中 | 已完成任务的刷新按钮不受其他任务运行态影响；刷新完成后即使 SSE 完成回调丢失，也能通过任务轮询恢复为刷新排名；前端构建、后端 API 测试和浏览器验证通过 |
 | 22 | finished | 补充项目根 Apache-2.0 协议并推送远端 | 新增根目录 LICENSE 与执行计划文档；根 package.json、package-lock.json、README 已声明 Apache-2.0；提交并推送到 tlh/main |
 | 23 | finished | 模仿 agent README 风格改造 App README 并推送远端 | 重写根 README 并新增 README_en.md；已包含中英文选择、居中关键词链接、项目简介、项目架构、部署方式和 Claude Code 致谢；提交并推送到 tlh/main |
+| 25 | finished | 固定模型配置 API Key 加密密钥契约 | 新增计划文档；服务启动自动生成并写回 CREDITS_ENCRYPTION_KEY；同步备份到 .secrets/；README 与 env 示例已更新；后端测试和前端构建通过 |

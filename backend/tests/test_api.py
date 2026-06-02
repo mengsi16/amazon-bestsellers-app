@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 def isolate_db(monkeypatch):
     """每个测试使用独立的数据库。"""
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-for-api-tests")
+    monkeypatch.setenv("CREDITS_ENCRYPTION_KEY", "test-credits-encryption-key-123456")
     # 重新加载模块以使用新的数据库路径
     import main
     main.DB_PATH = ":memory:"
@@ -50,6 +51,36 @@ def auth_headers(client):
     assert resp.status_code == 200
     token = resp.json()["token"]
     return {"Authorization": f"Bearer {token}"}
+
+
+def _register_test_user(client, email_prefix: str) -> dict:
+    """创建独立测试用户并返回认证 headers。"""
+    email = f"{email_prefix}_{id(client)}@xxx.com"
+    code_resp = client.post("/api/auth/email/send-code", json={
+        "email": email,
+        "purpose": "register",
+    })
+    assert code_resp.status_code == 200
+    resp = client.post("/api/auth/email/register", json={
+        "email": email,
+        "password": "testpassword123",
+        "code": code_resp.json()["dev_code"],
+    })
+    assert resp.status_code == 200
+    return {"Authorization": f"Bearer {resp.json()['token']}"}
+
+
+def _create_default_model_config(client, headers: dict) -> None:
+    resp = client.post("/api/model-configs", json={
+        "name": "测试模型配置",
+        "api_key": "sk-test-secret",
+        "base_url": "https://gateway.example.com",
+        "sonnet_model": "claude-sonnet-test",
+        "opus_model": "claude-opus-test",
+        "default_model_family": "sonnet",
+        "is_default": True,
+    }, headers=headers)
+    assert resp.status_code == 200
 
 
 class TestHealthEndpoint:
@@ -346,6 +377,7 @@ class TestTaskEndpoints:
 
     def test_create_task(self, client, auth_headers):
         """创建任务应返回任务信息。"""
+        _create_default_model_config(client, auth_headers)
         resp = client.post("/api/tasks", json={
             "url": "https://www.amazon.com/Bestsellers/zgbs/1234567890"
         }, headers=auth_headers)
@@ -356,13 +388,24 @@ class TestTaskEndpoints:
 
     def test_create_task_invalid_url(self, client, auth_headers):
         """无效 URL 应返回 400。"""
+        _create_default_model_config(client, auth_headers)
         resp = client.post("/api/tasks", json={
             "url": "https://www.google.com"
         }, headers=auth_headers)
         assert resp.status_code == 400
 
+    def test_create_task_requires_user_model_config(self, client, auth_headers):
+        """没有用户默认模型配置时，不能落回本机 Claude Code 用户级配置。"""
+        resp = client.post("/api/tasks", json={
+            "url": "https://www.amazon.com/Bestsellers/zgbs/1234567890"
+        }, headers=auth_headers)
+
+        assert resp.status_code == 400
+        assert "模型配置" in resp.json()["detail"]
+
     def test_list_tasks(self, client, auth_headers):
         """列出任务应返回列表。"""
+        _create_default_model_config(client, auth_headers)
         client.post("/api/tasks", json={
             "url": "https://www.amazon.com/Bestsellers/zgbs/1111111111"
         }, headers=auth_headers)
@@ -372,6 +415,7 @@ class TestTaskEndpoints:
 
     def test_get_task(self, client, auth_headers):
         """获取单个任务。"""
+        _create_default_model_config(client, auth_headers)
         create_resp = client.post("/api/tasks", json={
             "url": "https://www.amazon.com/Bestsellers/zgbs/2222222222"
         }, headers=auth_headers)
@@ -387,6 +431,7 @@ class TestTaskEndpoints:
 
     def test_delete_task(self, client, auth_headers):
         """删除任务。"""
+        _create_default_model_config(client, auth_headers)
         create_resp = client.post("/api/tasks", json={
             "url": "https://www.amazon.com/Bestsellers/zgbs/3333333333"
         }, headers=auth_headers)
@@ -400,6 +445,52 @@ class TestTaskEndpoints:
         """未认证访问应返回 401。"""
         resp = client.get("/api/tasks")
         assert resp.status_code == 401
+
+    def test_private_task_details_and_history_are_forbidden_to_other_user(self, client, auth_headers):
+        """用户不能通过猜 task_id 读取其他用户的任务详情、报告和历史。"""
+        _create_default_model_config(client, auth_headers)
+        other_headers = _register_test_user(client, "other_user")
+        _create_default_model_config(client, other_headers)
+        create_resp = client.post("/api/tasks", json={
+            "url": "https://www.amazon.com/Bestsellers/zgbs/4444444444"
+        }, headers=auth_headers)
+        assert create_resp.status_code == 200
+        task_id = create_resp.json()["id"]
+
+        import main
+        main._save_chat_message(task_id, "user", "私有问题")
+        main._save_chat_message(task_id, "assistant", "私有回答")
+
+        for method, path in [
+            ("get", f"/api/tasks/{task_id}"),
+            ("get", f"/api/tasks/{task_id}/reports"),
+            ("get", f"/api/tasks/{task_id}/history"),
+            ("post", f"/api/tasks/{task_id}/resume"),
+            ("post", f"/api/tasks/{task_id}/refresh"),
+        ]:
+            resp = getattr(client, method)(path, headers=other_headers)
+            assert resp.status_code == 403
+
+    def test_new_task_does_not_inherit_workspace_session_from_other_user(self, client, auth_headers):
+        """同类目新任务不应继承类目 workspace 中旧账号留下的 session_id。"""
+        _create_default_model_config(client, auth_headers)
+
+        import main
+        workspace = main._resolve_workspace_path("5555555555")
+        main._save_analysis_meta(workspace, {"session_id": "old-user-session"})
+
+        resp = client.post("/api/tasks", json={
+            "url": "https://www.amazon.com/Bestsellers/zgbs/5555555555"
+        }, headers=auth_headers)
+
+        assert resp.status_code == 200
+        assert resp.json()["session_id"] is None
+        usage = main._db.execute(
+            "SELECT user_id, browse_node_id, workspace_path FROM cache_usages WHERE task_id = ?",
+            (resp.json()["id"],),
+        ).fetchone()
+        assert usage is not None
+        assert usage[1] == "5555555555"
 
 
 class TestStreamHistory:

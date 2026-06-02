@@ -40,7 +40,60 @@ from urllib.request import Request as UrlRequest, urlopen
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
-load_dotenv()
+BACKEND_DIR = Path(__file__).parent
+APP_DIR = BACKEND_DIR.parent
+ENV_FILE = APP_DIR / ".env"
+SECRETS_DIR = APP_DIR / ".secrets"
+CREDITS_ENCRYPTION_KEY_BACKUP = SECRETS_DIR / "CREDITS_ENCRYPTION_KEY.bak"
+
+
+def _read_env_file_value(env_path: Path, key: str) -> Optional[str]:
+    if not env_path.exists():
+        return None
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, value = stripped.split("=", 1)
+        if name.strip() == key:
+            return value.strip()
+    return None
+
+
+def _write_env_file_value(env_path: Path, key: str, value: str) -> None:
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    updated = False
+    next_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            name, _current = stripped.split("=", 1)
+            if name.strip() == key:
+                next_lines.append(f"{key}={value}")
+                updated = True
+                continue
+        next_lines.append(line)
+    if not updated:
+        if next_lines and next_lines[-1] != "":
+            next_lines.append("")
+        next_lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(next_lines) + "\n", encoding="utf-8")
+
+
+def _ensure_credits_encryption_key(env_path: Path = ENV_FILE, backup_path: Path = CREDITS_ENCRYPTION_KEY_BACKUP) -> str:
+    key = _read_env_file_value(env_path, "CREDITS_ENCRYPTION_KEY") or os.environ.get("CREDITS_ENCRYPTION_KEY", "").strip()
+    if not key:
+        key = secrets.token_urlsafe(32)
+        _write_env_file_value(env_path, "CREDITS_ENCRYPTION_KEY", key)
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    if not backup_path.exists() or backup_path.read_text(encoding="utf-8").strip() != key:
+        backup_path.write_text(key + "\n", encoding="utf-8")
+    os.environ["CREDITS_ENCRYPTION_KEY"] = key
+    return key
+
+
+_ensure_credits_encryption_key()
+load_dotenv(ENV_FILE, override=False)
 
 import aiofiles
 import bcrypt
@@ -57,8 +110,6 @@ from streaming import StreamManager, extract_stream_session_id
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
-BACKEND_DIR = Path(__file__).parent
-APP_DIR = BACKEND_DIR.parent
 AGENT_DIR = APP_DIR / "agent"
 PLUGIN_DIR = str(AGENT_DIR)
 AGENT_ID = "amazon-bestsellers-summary:amazon-bestsellers-orchestrator"
@@ -172,6 +223,25 @@ def _init_db() -> sqlite3.Connection:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_tasks_browse_node
         ON tasks(browse_node_id)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cache_usages (
+            id             TEXT PRIMARY KEY,
+            task_id        TEXT NOT NULL,
+            user_id        TEXT NOT NULL,
+            browse_node_id TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            usage_type     TEXT NOT NULL DEFAULT 'workspace',
+            created_at     TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cache_usages_task
+        ON cache_usages(task_id)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cache_usages_user
+        ON cache_usages(user_id, browse_node_id)
     """)
     # T1: users 表 — 用户注册与登录
     conn.execute("""
@@ -309,10 +379,7 @@ def _get_fernet() -> Fernet:
     """获取 Fernet 加密实例，密钥从环境变量读取。"""
     key = os.environ.get("CREDITS_ENCRYPTION_KEY")
     if not key:
-        if os.environ.get("ENV") == "production":
-            raise RuntimeError("CREDITS_ENCRYPTION_KEY 环境变量未设置")
-        # 开发环境使用临时密钥
-        key = Fernet.generate_key().decode() if hasattr(Fernet, 'generate_key') else "devkey1234567890"
+        raise RuntimeError("CREDITS_ENCRYPTION_KEY 环境变量未设置，模型配置 API Key 无法稳定加密")
     if len(key) < 32:
         key = key.zfill(32)[:32]
     # Fernet 密钥需要是 32 字节且用 base64 编码
@@ -340,18 +407,9 @@ def _encrypt_api_key(api_key: str) -> str:
 
 
 def _decrypt_api_key(encrypted: str) -> str:
-    """解密 API key。失败时返回空字符串而非抛异常——避免 create_task 因 key 解密失败返回纯文本 500。"""
-    try:
-        f = _get_fernet()
-        return f.decrypt(encrypted.encode()).decode()
-    except Exception as exc:
-        LOGGER.error(
-            "API key 解密失败，exception_type=%s，encrypted_len=%d — 返回空字符串降级",
-            type(exc).__name__,
-            len(encrypted),
-            exc_info=True,
-        )
-        return ""
+    """解密 API key。失败即抛出，避免使用错误配置继续运行。"""
+    f = _get_fernet()
+    return f.decrypt(encrypted.encode()).decode()
 
 
 # ── JWT 认证 ──────────────────────────────────────────────────────────────────
@@ -759,11 +817,11 @@ def _decode_jwt(token: str) -> Optional[dict]:
 
 
 def _get_current_user_id(request: Request) -> Optional[str]:
-    """从 Authorization header 提取 user_id，未认证返回 None。"""
+    """从 Authorization header 或 SSE query token 提取 user_id。"""
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
+    token = auth[7:] if auth.startswith("Bearer ") else request.query_params.get("token", "")
+    if not token:
         return None
-    token = auth[7:]
     payload = _decode_jwt(token)
     if payload is None:
         return None
@@ -776,6 +834,20 @@ def _require_user(request: Request) -> str:
     if not user_id:
         raise HTTPException(status_code=401, detail="未登录，请先登录")
     return user_id
+
+
+def _require_task_access(task_id: str, request: Request, write: bool = False) -> tuple[dict[str, "Task"], "Task", str]:
+    """读取 task 并校验当前用户权限。"""
+    user_id = _require_user(request)
+    tasks = _load_tasks()
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = tasks[task_id]
+    if task.owner_id == user_id:
+        return tasks, task, user_id
+    if not write and task.is_public:
+        return tasks, task, user_id
+    raise HTTPException(status_code=403, detail="无权访问他人的任务")
 
 
 # ── Models (auth) ─────────────────────────────────────────────────────────────
@@ -1086,10 +1158,28 @@ def _sync_task_analysis_meta(task: Task) -> None:
         "workspace_path": task.workspace_path,
         "last_task_id": task.id,
         "last_url": task.url,
-        "session_id": task.session_id,
+        "session_id": "",
         "created_at": task.created_at,
         "updated_at": task.updated_at,
     })
+
+
+def _record_cache_usage(task: Task, user_id: str) -> None:
+    """记录用户 task 对类目 workspace 缓存的使用。"""
+    _db.execute(
+        """INSERT INTO cache_usages
+           (id, task_id, user_id, browse_node_id, workspace_path, usage_type, created_at)
+           VALUES (?, ?, ?, ?, ?, 'workspace', ?)""",
+        (
+            str(uuid.uuid4())[:12],
+            task.id,
+            user_id,
+            task.browse_node_id,
+            task.workspace_path,
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    _db.commit()
 
 
 def _extract_stream_session_id(raw_line: str) -> Optional[str]:
@@ -1191,11 +1281,7 @@ def _is_task_execution_active(task: Task) -> bool:
 def _reconcile_task(task: Task) -> Task:
     # Always pin workspace_path to canonical; legacy values get rewritten.
     task.workspace_path = str(_resolve_workspace_path(task.browse_node_id))
-    meta = _load_analysis_meta(task.workspace_path)
-    meta_session_id = meta.get("session_id")
-    if isinstance(meta_session_id, str) and meta_session_id.strip():
-        task.session_id = meta_session_id.strip()
-    elif task.session_id:
+    if task.session_id:
         _sync_task_analysis_meta(task)
     # T4: 若文件系统和 task 都无 session_id，尝试从 SQLite sessions 表恢复
     if not task.session_id:
@@ -1527,6 +1613,15 @@ def _load_default_model_config(user_id: Optional[str]) -> Optional[dict]:
     }
 
 
+def _require_default_model_config(user_id: str) -> dict:
+    config = _load_default_model_config(user_id)
+    if config is None:
+        raise HTTPException(status_code=400, detail="请先添加并设为默认模型配置，再开始分析")
+    if not config["api_key"]:
+        raise HTTPException(status_code=400, detail="默认模型配置缺少 API Key")
+    return config
+
+
 def _select_config_model(config: Optional[dict], model_family: Optional[str]) -> str:
     if config is None:
         return ""
@@ -1542,6 +1637,8 @@ def _build_claude_cli_config(
     model_family: Optional[str] = None,
 ) -> dict:
     default_config = _load_default_model_config(user_id)
+    if default_config is None:
+        raise RuntimeError("当前用户没有默认模型配置，不能使用本机 Claude Code 用户级配置")
     model = (explicit_model or "").strip()
     if not model:
         model = _select_config_model(default_config, model_family)
@@ -2239,6 +2336,7 @@ async def get_credits_logs(request: Request, limit: int = 50, offset: int = 0):
 @limiter.limit("10/minute")
 async def create_task(req: CreateTaskRequest, request: Request):
     user_id = _require_user(request)
+    default_config = _require_default_model_config(user_id)
     try:
         browse_node_id = _extract_browse_node_id(req.url)
     except ValueError as e:
@@ -2248,19 +2346,17 @@ async def create_task(req: CreateTaskRequest, request: Request):
     task_id = str(uuid.uuid4())[:12]
     now = datetime.utcnow().isoformat()
     workspace_path = str(_resolve_workspace_path(browse_node_id))
-    meta = _load_analysis_meta(workspace_path)
-    saved_session_id = meta.get("session_id") if isinstance(meta.get("session_id"), str) else None
     task_model = (req.model or "").strip() or None
-    if task_model is None and req.model_family:
+    if task_model is None:
         _normalize_model_family(req.model_family)
-        task_model = _select_config_model(_load_default_model_config(user_id), req.model_family) or None
+        task_model = _select_config_model(default_config, req.model_family) or None
 
     task = Task(
         id=task_id,
         url=req.url,
         browse_node_id=browse_node_id,
         model=task_model,
-        session_id=saved_session_id.strip() if saved_session_id and saved_session_id.strip() else None,
+        session_id=None,
         status=TaskStatus.PENDING,
         created_at=now,
         updated_at=now,
@@ -2272,6 +2368,7 @@ async def create_task(req: CreateTaskRequest, request: Request):
     tasks[task_id] = task
     _save_tasks(tasks)
     _sync_task_analysis_meta(task)
+    _record_cache_usage(task, user_id)
     _mark_browse_node_active(browse_node_id, task_id)
 
     # Launch async background analysis
@@ -2281,20 +2378,14 @@ async def create_task(req: CreateTaskRequest, request: Request):
 
 
 @app.post("/api/tasks/{task_id}/resume", response_model=Task, response_model_exclude={"workspace_path"})
-async def resume_task(task_id: str):
-    tasks = _load_tasks()
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    task = tasks[task_id]
+async def resume_task(task_id: str, request: Request):
+    tasks, task, user_id = _require_task_access(task_id, request, write=True)
+    _require_default_model_config(user_id)
     if task.status == TaskStatus.RUNNING and task_id in _running_processes:
         raise HTTPException(status_code=409, detail="Task is already running")
     _assert_browse_node_not_running(task.browse_node_id, exclude_task_id=task_id)
 
     task.workspace_path = str(_resolve_workspace_path(task.browse_node_id, task.workspace_path))
-    meta = _load_analysis_meta(task.workspace_path)
-    saved_session_id = meta.get("session_id") if isinstance(meta.get("session_id"), str) else None
-    if saved_session_id and saved_session_id.strip():
-        task.session_id = saved_session_id.strip()
     task.status = TaskStatus.PENDING
     task.error = None
     task.updated_at = datetime.utcnow().isoformat()
@@ -2309,7 +2400,7 @@ async def resume_task(task_id: str):
 
 
 @app.post("/api/tasks/{task_id}/refresh", response_model=Task, response_model_exclude={"workspace_path"})
-async def refresh_task(task_id: str):
+async def refresh_task(task_id: str, request: Request):
     """Incremental update: re-crawl category list for latest ranks, then only
     process new/changed ASINs and re-run analysts + summary.
 
@@ -2317,10 +2408,8 @@ async def refresh_task(task_id: str):
     existing category data. Uses a different prompt to trigger the orchestrator's
     incremental update mode.
     """
-    tasks = _load_tasks()
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    task = tasks[task_id]
+    tasks, task, user_id = _require_task_access(task_id, request, write=True)
+    _require_default_model_config(user_id)
     if task.status == TaskStatus.RUNNING and task_id in _running_processes:
         raise HTTPException(status_code=409, detail="Task is already running")
     _assert_browse_node_not_running(task.browse_node_id, exclude_task_id=task_id)
@@ -2335,10 +2424,6 @@ async def refresh_task(task_id: str):
             detail="该类目尚未完成过分析，无法增量更新。请先创建新的分析任务。",
         )
 
-    meta = _load_analysis_meta(task.workspace_path)
-    saved_session_id = meta.get("session_id") if isinstance(meta.get("session_id"), str) else None
-    if saved_session_id and saved_session_id.strip():
-        task.session_id = saved_session_id.strip()
     task.status = TaskStatus.PENDING
     task.error = None
     task.updated_at = datetime.utcnow().isoformat()
@@ -2365,14 +2450,8 @@ async def reanalyze_task(task_id: str, request: Request):
     next run is a completely fresh analysis — no residual state from the
     previous run.
     """
-    user_id = _require_user(request)
-    tasks = _load_tasks()
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    task = tasks[task_id]
-    # T2: 权限校验 — 只有任务创建者可以全量重新分析
-    if task.owner_id and task.owner_id != user_id:
-        raise HTTPException(status_code=403, detail="无权操作他人的任务")
+    tasks, task, user_id = _require_task_access(task_id, request, write=True)
+    _require_default_model_config(user_id)
     if task.status == TaskStatus.RUNNING and task_id in _running_processes:
         raise HTTPException(status_code=409, detail="Task is already running")
     _assert_browse_node_not_running(task.browse_node_id, exclude_task_id=task_id)
@@ -2444,27 +2523,20 @@ async def list_tasks(
 
 
 @app.get("/api/tasks/{task_id}", response_model=Task, response_model_exclude={"workspace_path"})
-async def get_task(task_id: str):
-    tasks = _load_tasks()
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return tasks[task_id]
+async def get_task(task_id: str, request: Request):
+    _, task, _ = _require_task_access(task_id, request)
+    return task
 
 
 @app.get("/api/tasks/{task_id}/progress")
-async def task_progress(task_id: str):
-    tasks = _load_tasks()
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
+async def task_progress(task_id: str, request: Request):
+    _require_task_access(task_id, request)
     return EventSourceResponse(_progress_generator(task_id))
 
 
 @app.get("/api/tasks/{task_id}/reports")
-async def get_reports(task_id: str):
-    tasks = _load_tasks()
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    task = tasks[task_id]
+async def get_reports(task_id: str, request: Request):
+    _, task, _ = _require_task_access(task_id, request)
     reports = _get_report_files(task.workspace_path)
     phases = _build_progress_from_workspace(task.workspace_path)
     return {
@@ -2485,12 +2557,9 @@ _REPORT_FILE_MAP = {
 
 
 @app.get("/api/tasks/{task_id}/download/{dim}")
-async def download_report(task_id: str, dim: str):
+async def download_report(task_id: str, dim: str, request: Request):
     """Serve a dimension report as a downloadable .md file."""
-    tasks = _load_tasks()
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    task = tasks[task_id]
+    _, task, _ = _require_task_access(task_id, request)
 
     rel = _REPORT_FILE_MAP.get(dim)
     if not rel:
@@ -2521,15 +2590,13 @@ async def download_report(task_id: str, dim: str):
 
 
 @app.post("/api/tasks/{task_id}/chat")
-async def chat_with_task(task_id: str, req: ChatRequest):
+async def chat_with_task(task_id: str, req: ChatRequest, request: Request):
     """
     Proxy a follow-up question through claude CLI with conversation continuation.
     Streams the response back as SSE.
     """
-    tasks = _load_tasks()
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    task = tasks[task_id]
+    _, task, user_id = _require_task_access(task_id, request, write=True)
+    _require_default_model_config(user_id)
     _assert_browse_node_not_running(task.browse_node_id)
 
     # R12: prevent concurrent chat requests on the same task
@@ -2660,14 +2727,7 @@ async def chat_with_task(task_id: str, req: ChatRequest):
 
 @app.delete("/api/tasks/{task_id}")
 async def delete_task(task_id: str, request: Request):
-    user_id = _require_user(request)
-    tasks = _load_tasks()
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    task = tasks[task_id]
-    # T2: 权限校验 — 只有任务创建者可以删除
-    if task.owner_id and task.owner_id != user_id:
-        raise HTTPException(status_code=403, detail="无权删除他人的任务")
+    _, task, _ = _require_task_access(task_id, request, write=True)
     # Kill running process if any
     proc = _running_processes.pop(task_id, None)
     if proc:
@@ -2693,14 +2753,7 @@ async def delete_task(task_id: str, request: Request):
 @app.post("/api/tasks/{task_id}/cancel", response_model=Task, response_model_exclude={"workspace_path"})
 async def cancel_task(task_id: str, request: Request):
     """取消运行中的任务。保留 workspace 中间数据。"""
-    user_id = _require_user(request)
-    tasks = _load_tasks()
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    task = tasks[task_id]
-    # 权限校验
-    if task.owner_id and task.owner_id != user_id:
-        raise HTTPException(status_code=403, detail="无权取消他人的任务")
+    _, task, _ = _require_task_access(task_id, request, write=True)
     if task.status not in (TaskStatus.RUNNING, TaskStatus.PENDING):
         raise HTTPException(status_code=409, detail=f"任务状态为 {task.status}，无法取消")
     # 终止子进程
@@ -2722,15 +2775,13 @@ async def cancel_task(task_id: str, request: Request):
 
 
 @app.get("/api/tasks/{task_id}/history")
-async def get_task_history(task_id: str):
+async def get_task_history(task_id: str, request: Request):
     """Return persisted conversation history (stream items + chat messages).
 
     Used by the frontend to restore conversation when switching tasks or
     after a page refresh — no need to keep SSE open for completed tasks.
     """
-    tasks = _load_tasks()
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
+    _require_task_access(task_id, request)
 
     stream_items, stream_order = _load_stream_history(task_id)
     chat_messages = _load_chat_history(task_id)

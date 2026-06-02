@@ -47,10 +47,11 @@ The app layer provides a durable task workspace: authentication, task history, l
 | Category analysis tasks | Create an analysis task from an Amazon Bestsellers category URL and resolve the Browse Node ID |
 | Live progress | Display Claude Code stream-json events, tool calls, system logs, and execution phases through SSE |
 | Report reading | Read summary, marketplace, reviews, A+ content, and fine-grained Markdown reports in the UI |
-| Follow-up Q&A | Ask follow-up questions on completed tasks with task workspace and Claude Code session reuse |
+| Follow-up Q&A | Ask follow-up questions on completed tasks using the task owner's model config, workspace, and Claude Code session |
 | Refresh and rerun | Refresh ranking data, resume from checkpoints, run a full reanalysis, cancel, or delete tasks |
 | Authentication | Email-code signup and login, with Google and GitHub OAuth configuration support |
-| Model configuration | Maintain multiple model profiles, switch defaults, and store API keys encrypted |
+| Per-user model configuration | Each user owns their API key, base URL, and model names; analysis subprocesses receive the task owner's config to avoid cross-account leakage |
+| Task isolation and cache audit | Private tasks, stream history, and chat history are owner-only by default; shared Browse Node workspaces can be reused, with each usage recorded in `cache_usages` |
 | Credits tracking | Extract token and cost usage from Claude Code result events and persist them in SQLite |
 | History restore | Persist stream items and chat messages so context survives task switching and service restarts |
 
@@ -101,15 +102,15 @@ sequenceDiagram
 
     U->>F: "Submit Bestsellers URL"
     F->>B: "POST /api/tasks"
-    B->>W: "Create task and workspace"
-    B->>C: "Start claude --output-format stream-json"
+    B->>W: "Create owner task, workspace, and cache usage record"
+    B->>C: "Inject task owner API key/base URL and start claude"
     C->>A: "Run orchestrator"
     A->>W: "Write crawl data, chunks, and reports"
     C-->>B: "stream-json events"
     B-->>F: "SSE live progress"
     U->>F: "Read reports or ask follow-up"
     F->>B: "POST /api/tasks/{id}/chat"
-    B->>C: "Reuse session_id and workspace context"
+    B->>C: "Use task owner config with session_id and workspace context"
     C-->>F: "Streaming answer"
 ```
 
@@ -117,7 +118,7 @@ sequenceDiagram
 
 ### Docker Compose
 
-Copy `.env.example` to `.env`, then set `JWT_SECRET_KEY` and `CREDITS_ENCRYPTION_KEY` for production. Configure Google and GitHub client credentials only when OAuth login is needed.
+Copy `.env.example` to `.env`. For local development, `CREDITS_ENCRYPTION_KEY` may be left empty: the backend will generate it on startup, write it back to `.env`, and back it up to `.secrets/CREDITS_ENCRYPTION_KEY.bak`. For production, set it explicitly through a secret or environment variable, and also set `JWT_SECRET_KEY`. Configure Google and GitHub client credentials only when OAuth login is needed.
 
 ```bash
 docker-compose up -d --build
@@ -165,7 +166,7 @@ The default frontend URL is `http://localhost:5173`, and the backend URL is `htt
 | `JWT_SECRET_KEY` | Yes in production | random in development | JWT signing secret |
 | `JWT_SECRET_KEY_PREVIOUS` | No | empty | previous JWT secret during key rotation |
 | `CORS_ORIGINS` | No | `http://localhost:5173` | allowed frontend origins, comma-separated |
-| `CREDITS_ENCRYPTION_KEY` | Yes in production | random in development | encryption key for model API keys |
+| `CREDITS_ENCRYPTION_KEY` | Recommended explicit value in production | auto-generated locally on startup | encryption key for model API keys; local startup writes it to `.env` and backs it up under `.secrets/` |
 | `PORT` | No | `8000` | backend port |
 | `DB_PATH` | No | `backend/conversations.db` | SQLite database path |
 | `WORKSPACE_BASE` | No | `backend/workspace` | analysis workspace path |
@@ -189,7 +190,7 @@ Local Playwright screenshots and test artifacts are written to `.playwright-*` o
 
 | Data | Default path | Description |
 |---|---|---|
-| SQLite | `backend/conversations.db` | users, tasks, sessions, stream items, chat messages, model configs, and Credits |
+| SQLite | `backend/conversations.db` | users, tasks, sessions, stream items, chat messages, per-user model configs, cache usage records, and Credits |
 | Workspace | `backend/workspace` | crawl data, product HTML, images, chunks, reports, and analysis metadata |
 | Docker SQLite | `/app/data/conversations.db` | persisted through the `backend-db` volume |
 | Docker Workspace | `/app/workspace` | persisted through the `backend-data` volume |
